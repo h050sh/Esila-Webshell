@@ -1600,6 +1600,7 @@ async function loadSysinfo() {
     html += '<div style="margin-top:16px;display:flex;gap:8px">';
     html += '<button class="btn btn-primary" onclick="findSuid()">Find SUID / Privesc</button>';
     html += '<button class="btn" onclick="findWritable()">Find Writable Dirs</button>';
+    html += '<button class="btn" onclick="findSecrets()">Find Secrets &amp; Keys</button>';
     html += '</div>';
     if (info.env) html += '<div class="card" style="margin-top:16px"><h3 style="margin-bottom:8px;font-size:14px">Environment</h3><div class="code-box" onclick="copyText(this.textContent)" style="max-height:300px">' + esc(info.env) + '</div></div>';
     if (info.passwd && info.passwd !== 'N/A on Windows') html += '<div class="card" style="margin-top:16px"><h3 style="margin-bottom:8px;font-size:14px">/etc/passwd</h3><div class="code-box" onclick="copyText(this.textContent)" style="max-height:300px">' + esc(info.passwd) + '</div></div>';
@@ -1618,6 +1619,12 @@ async function findWritable() {
     body.innerHTML = '<p style="color:var(--text-dim)">Searching...</p>';
     const data = await apiJson({action:'find_writable'});
     body.innerHTML = '<h3 style="margin-bottom:12px">Writable Directories</h3><div class="code-box">' + esc(data.result || 'None found') + '</div><br><button class="btn" onclick="loadSysinfo()">Back to System Info</button>';
+}
+async function findSecrets() {
+    var body = $('sysinfo-body');
+    body.innerHTML = '<p style="color:var(--text-dim)">Searching for secrets, SSH keys, listening ports...</p>';
+    var data = await apiJson({action:'find_secrets'});
+    body.innerHTML = '<h3 style="margin-bottom:12px">Secrets, Keys &amp; Ports</h3><div class="code-box" style="white-space:pre-wrap">' + esc(data.result || 'None found') + '</div><br><button class="btn" onclick="loadSysinfo()">Back to System Info</button>';
 }
 
 // ===== NETWORK TOOLS =====
